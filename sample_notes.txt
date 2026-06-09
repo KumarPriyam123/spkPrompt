@@ -1,0 +1,39 @@
+# Welcome to Privacy Overlay
+
+## This window is invisible to screen share
+
+Regular text looks like this. You can mix in **bold words** anywhere inline.
+
+- Press  ← →  to navigate slides
+- Drag the top bar to move
+- Drag  ◢  to resize
+- Click  ⋮  for controls
+
+---
+
+# Second Slide
+
+## Subheading in teal
+
+Some notes for this section. Keep them **short and scannable** during a call.
+
+- Point one
+- Point two
+- Point three
+
+---
+
+# Third Slide — Longer Content
+
+## Setup Recap
+
+Everything built **without admin** and **without DLL injection**.
+
+- Stage 1: self-cloaking proof of concept ✓
+- Stage 2: slide cards + file loading ✓
+- Stage 3: Firebase phone sync (coming next)
+
+## Key Win32 Detail
+
+**SetWindowDisplayAffinity** only works same-process.
+We get our own HWND via  winfo_id() → GetParent().
