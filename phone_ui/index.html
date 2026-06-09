@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Overlay Notes</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1b2e;
+      color: #d9d9e3;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: #252737;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid #3d3f5c;
+      flex-shrink: 0;
+    }
+
+    header h1 { font-size: 14px; font-weight: 600; color: #e0c3fc; flex: 1; }
+
+    .mode-toggle {
+      display: flex;
+      background: #1a1b2e;
+      border-radius: 6px;
+      padding: 3px;
+      gap: 2px;
+    }
+    .mode-btn {
+      padding: 4px 12px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      background: transparent;
+      color: #6c6f93;
+      transition: all 0.15s;
+    }
+    .mode-btn.active { background: #3d3f5c; color: #e0c3fc; }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #3d3f5c;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .status-dot.connected  { background: #72efdd; }
+    .status-dot.error      { background: #ff6b6b; }
+
+    /* ── PANELS ── */
+    .config-panel {
+      background: #252737;
+      padding: 12px 16px;
+      border-bottom: 1px solid #3d3f5c;
+      flex-shrink: 0;
+    }
+    .config-panel label {
+      font-size: 11px;
+      color: #6c6f93;
+      display: block;
+      margin-bottom: 5px;
+    }
+    .config-panel input {
+      width: 100%;
+      background: #1a1b2e;
+      border: 1px solid #3d3f5c;
+      color: #d9d9e3;
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+    }
+    .config-panel input:focus { border-color: #e0c3fc; }
+
+    .local-row { display: flex; gap: 8px; }
+    .local-row input { flex: 1; }
+    .local-row input:focus { border-color: #f77f00 !important; }
+
+    .connect-btn {
+      padding: 7px 14px;
+      background: #f77f00;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .connect-btn:hover { background: #e07000; }
+
+    /* ── NOTES AREA ── */
+    .notes-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    #notes {
+      flex: 1;
+      background: #252737;
+      color: #d9d9e3;
+      border: none;
+      outline: none;
+      padding: 16px;
+      font-size: 15px;
+      line-height: 1.65;
+      font-family: "Segoe UI", system-ui, monospace;
+      resize: none;
+    }
+
+    .hint {
+      background: #1a1b2e;
+      padding: 7px 16px;
+      font-size: 11px;
+      color: #3d3f5c;
+      text-align: center;
+      flex-shrink: 0;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Overlay Notes</h1>
+  <div class="mode-toggle">
+    <button class="mode-btn active" id="btn-firebase" onclick="setMode('firebase')">Firebase</button>
+    <button class="mode-btn"        id="btn-local"    onclick="setMode('local')">Local</button>
+  </div>
+  <div class="status-dot" id="dot"></div>
+</header>
+
+<!-- Firebase panel -->
+<div class="config-panel" id="firebase-panel">
+  <label>Firebase Database URL</label>
+  <input type="url" id="fb-url"
+         placeholder="https://your-project-default-rtdb.firebaseio.com" />
+</div>
+
+<!-- Local WS panel -->
+<div class="config-panel hidden" id="local-panel">
+  <label>Overlay laptop  IP : port</label>
+  <div class="local-row">
+    <input type="text" id="ws-addr" placeholder="192.168.1.42:8765" />
+    <button class="connect-btn" onclick="connectWS()">Connect</button>
+  </div>
+</div>
+
+<div class="notes-wrap">
+  <textarea id="notes"
+    placeholder="Type your notes here.
+
+Use  ---  on its own line to separate slides.
+Use  #  for headings,  ##  for subheadings.
+Use  **text**  for bold.
+Use  -  for bullet points."></textarea>
+  <div class="hint">Saves automatically · use  ---  to separate slides</div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// HOW THIS WORKS
+//
+// Firebase mode  — uses the Firebase Realtime Database REST API directly.
+//   No SDK, no API key needed while test mode rules are active.
+//   REST API is just two HTTP calls:
+//     GET  /overlay/content.json          → read current value
+//     PUT  /overlay/content.json  + body  → write new value
+//
+// Local mode — connects a WebSocket to the Python overlay server running on
+//   your LAN. The overlay runs 'python overlay.py --local' which starts
+//   a WebSocket server on port 8765. You type here → WS message → overlay.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const dot      = document.getElementById("dot");
+const textarea = document.getElementById("notes");
+
+let mode     = "firebase";
+let ws       = null;
+let debounce = null;
+
+
+// ── STATUS DOT ───────────────────────────────────────────────────────────────
+
+function setDot(state) {
+  dot.className = "status-dot" +
+    (state === "connected"  ? " connected" :
+     state === "error"      ? " error"     : "");
+}
+
+
+// ── MODE TOGGLE ──────────────────────────────────────────────────────────────
+
+function setMode(m) {
+  mode = m;
+  document.getElementById("btn-firebase").classList.toggle("active", m === "firebase");
+  document.getElementById("btn-local").classList.toggle("active", m === "local");
+  document.getElementById("firebase-panel").classList.toggle("hidden", m !== "firebase");
+  document.getElementById("local-panel").classList.toggle("hidden", m !== "local");
+  setDot("disconnected");
+  if (m === "local") disconnectWS();
+  localStorage.setItem("overlay-mode", m);
+}
+
+
+// ── FIREBASE MODE — plain fetch() against the REST API ───────────────────────
+//
+// Firebase RTDB exposes every node as a URL ending in .json
+// With test mode rules (.read=true, .write=true) no auth header is needed.
+//
+// Reading:  GET  https://<db-url>/overlay/content.json
+//           Response body: a JSON-encoded string, e.g. "\"hello\""
+//
+// Writing:  PUT  https://<db-url>/overlay/content.json
+//           Body: JSON.stringify(text)  →  "\"your notes text\""
+
+function getDbUrl() {
+  return document.getElementById("fb-url").value.trim().replace(/\/$/, "");
+}
+
+async function fbLoad() {
+  const url = getDbUrl();
+  if (!url) return;
+  try {
+    const r = await fetch(`${url}/overlay/content.json`);
+    if (!r.ok) throw new Error(r.status);
+    const val = await r.json();           // Firebase returns JSON — a string or null
+    if (typeof val === "string") textarea.value = val;
+    setDot("connected");
+    localStorage.setItem("overlay-fb-url", url);
+  } catch(e) {
+    setDot("error");
+  }
+}
+
+async function fbWrite(text) {
+  const url = getDbUrl();
+  if (!url) return;
+  try {
+    const r = await fetch(`${url}/overlay/content.json`, {
+      method:  "PUT",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(text),       // wraps the string in JSON quotes
+    });
+    if (!r.ok) throw new Error(r.status);
+    setDot("connected");
+  } catch(e) {
+    setDot("error");
+  }
+}
+
+// Test the connection when the URL field loses focus or Enter is pressed
+document.getElementById("fb-url").addEventListener("change", fbLoad);
+document.getElementById("fb-url").addEventListener("keydown", e => {
+  if (e.key === "Enter") fbLoad();
+});
+
+
+// ── LOCAL WEBSOCKET MODE ─────────────────────────────────────────────────────
+
+function connectWS() {
+  const addr = document.getElementById("ws-addr").value.trim();
+  if (!addr) return;
+  disconnectWS();
+  localStorage.setItem("overlay-ws-addr", addr);
+  try {
+    ws = new WebSocket(`ws://${addr}`);
+    ws.onopen    = () => setDot("connected");
+    ws.onclose   = () => { setDot("disconnected"); ws = null; };
+    ws.onerror   = () => setDot("error");
+    ws.onmessage = e  => { if (e.data !== textarea.value) textarea.value = e.data; };
+  } catch(e) { setDot("error"); }
+}
+
+function disconnectWS() {
+  if (ws) { ws.close(); ws = null; }
+}
+
+
+// ── TEXTAREA INPUT ────────────────────────────────────────────────────────────
+//
+// Debounced 300ms: waits for a 300ms pause after the last keystroke before
+// sending. Prevents flooding Firebase with every individual character.
+
+textarea.addEventListener("input", () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(() => {
+    const text = textarea.value;
+    if (mode === "firebase") {
+      fbWrite(text);
+    } else if (mode === "local" && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(text);
+    }
+  }, 150);
+});
+
+
+// ── RESTORE SAVED STATE ───────────────────────────────────────────────────────
+
+const savedMode   = localStorage.getItem("overlay-mode")    || "firebase";
+const savedFbUrl  = localStorage.getItem("overlay-fb-url")  || "";
+const savedWsAddr = localStorage.getItem("overlay-ws-addr") || "";
+
+document.getElementById("fb-url").value  = savedFbUrl;
+document.getElementById("ws-addr").value = savedWsAddr;
+
+setMode(savedMode);
+
+// Auto-load content if a saved Firebase URL exists
+if (savedMode === "firebase" && savedFbUrl) fbLoad();
+</script>
+
+</body>
+</html>

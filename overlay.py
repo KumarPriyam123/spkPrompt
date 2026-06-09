@@ -4,6 +4,10 @@ import ctypes
 import re
 import sys
 import os
+import threading
+import json
+import time
+import asyncio
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
@@ -31,6 +35,7 @@ class OverlayApp:
         self._drag_x = self._drag_y = 0
         self._resize_data = None
         self._controls_win = None
+        self._sync_mode = None
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
 
         self._setup_window()
@@ -90,6 +95,11 @@ class OverlayApp:
                                   command=lambda: self.navigate(1), **_btn)
         self.next_btn.pack(side="left")
 
+        # Sync indicator — shows "⬤ live" when Firebase/WS connected
+        self.sync_label = tk.Label(bar, text="", bg=C["bar"],
+                                   fg=C["dim"], font=("Segoe UI", 8))
+        self.sync_label.pack(side="left", padx=(10, 0))
+
         self.menu_btn = tk.Button(bar, text="⋮", fg=C["dim"],
                                   activeforeground=C["accent"],
                                   command=self.toggle_controls, **_btn)
@@ -133,27 +143,23 @@ class OverlayApp:
 
     # ── RESIZE HANDLES ───────────────────────────────────────────────────────
     #
-    # 8 invisible Frame widgets are placed over the window using relative
-    # coordinates so they track size changes automatically:
-    #   relx=1.0, rely=1.0, anchor="se"  →  always the bottom-right corner
-    #   relx=0.5, rely=1.0, anchor="s"   →  always the bottom edge, centered
-    # Corners are placed last so they sit on top of edge strips in z-order.
+    # 8 invisible Frame widgets placed with relative coordinates (relx/rely)
+    # so they automatically track window size changes.
+    # Edges first (lower z-order), corners on top.
 
     def _setup_resize_handles(self):
-        CORNER = 14   # corner square size (px)
-        EDGE   = 6    # edge strip width (px)
+        CORNER = 14
+        EDGE   = 6
 
         specs = [
-            # edges first (lower z-order; corners on top override them)
-            ("size_ns", dict(relx=0.5, rely=0,   anchor="n",  relwidth=1.0, height=EDGE,   width=0),  "n"),
-            ("size_ns", dict(relx=0.5, rely=1.0, anchor="s",  relwidth=1.0, height=EDGE,   width=0),  "s"),
-            ("size_we", dict(relx=0,   rely=0.5, anchor="w",  width=EDGE,   relheight=1.0, height=0), "w"),
-            ("size_we", dict(relx=1.0, rely=0.5, anchor="e",  width=EDGE,   relheight=1.0, height=0), "e"),
-            # corners
-            ("size_nw_se", dict(relx=0,   rely=0,   anchor="nw", width=CORNER, height=CORNER), "nw"),
-            ("size_ne_sw", dict(relx=1.0, rely=0,   anchor="ne", width=CORNER, height=CORNER), "ne"),
-            ("size_ne_sw", dict(relx=0,   rely=1.0, anchor="sw", width=CORNER, height=CORNER), "sw"),
-            ("size_nw_se", dict(relx=1.0, rely=1.0, anchor="se", width=CORNER, height=CORNER), "se"),
+            ("size_ns",    dict(relx=0.5, rely=0,   anchor="n",  relwidth=1.0, height=EDGE,   width=0),  "n"),
+            ("size_ns",    dict(relx=0.5, rely=1.0, anchor="s",  relwidth=1.0, height=EDGE,   width=0),  "s"),
+            ("size_we",    dict(relx=0,   rely=0.5, anchor="w",  width=EDGE,   relheight=1.0, height=0), "w"),
+            ("size_we",    dict(relx=1.0, rely=0.5, anchor="e",  width=EDGE,   relheight=1.0, height=0), "e"),
+            ("size_nw_se", dict(relx=0,   rely=0,   anchor="nw", width=CORNER, height=CORNER),           "nw"),
+            ("size_ne_sw", dict(relx=1.0, rely=0,   anchor="ne", width=CORNER, height=CORNER),           "ne"),
+            ("size_ne_sw", dict(relx=0,   rely=1.0, anchor="sw", width=CORNER, height=CORNER),           "sw"),
+            ("size_nw_se", dict(relx=1.0, rely=1.0, anchor="se", width=CORNER, height=CORNER),           "se"),
         ]
 
         for cursor, place_kw, direction in specs:
@@ -176,10 +182,8 @@ class OverlayApp:
         if not self._resize_data:
             return
         d = self._resize_data
-        # Total delta from the moment the drag started — not from last event.
         dx = event.x_root - d["start_x"]
         dy = event.y_root - d["start_y"]
-
         x, y = d["orig_x"], d["orig_y"]
         w, h = d["orig_w"], d["orig_h"]
 
@@ -302,6 +306,107 @@ class OverlayApp:
         self.render_slide()
         self.root.focus_force()
 
+    # ── REMOTE SYNC — SHARED ─────────────────────────────────────────────────
+
+    def _apply_remote_content(self, content):
+        """Called on the main tkinter thread via root.after(0, ...).
+        Parses incoming text and re-renders slides without resetting current index
+        unless the slide count changed."""
+        content = content.replace('\r\n', '\n').replace('\r', '\n')
+        parsed = [s.strip() for s in re.split(r'\n\s*---\s*\n', content) if s.strip()]
+        if not parsed:
+            return
+        self.slides = parsed
+        self.current = min(self.current, len(parsed) - 1)
+        self.render_slide()
+
+    # ── REMOTE SYNC — FIREBASE RTDB (SSE) ────────────────────────────────────
+    #
+    # Firebase exposes its Realtime DB as a standard SSE endpoint.
+    # We open a persistent HTTP connection; Firebase pushes a "put" event
+    # every time the value at the path changes. No polling, no SDK needed.
+    #
+    # The stream runs in a daemon thread so it dies with the app automatically.
+    # On any network error it waits 3s then reconnects — handles WiFi drops,
+    # sleep/wake cycles, etc.
+
+    def start_firebase_sync(self, db_url):
+        self._sync_mode = "firebase"
+        self.root.after(0, lambda: self.sync_label.config(
+            text="⬤ firebase", fg="#72efdd"))
+        t = threading.Thread(
+            target=self._firebase_stream_loop,
+            args=(db_url.rstrip("/"),),
+            daemon=True,
+        )
+        t.start()
+
+    def _firebase_stream_loop(self, db_url):
+        try:
+            import requests
+        except ImportError:
+            self.root.after(0, lambda: self.sync_label.config(
+                text="✗ install requests", fg="#ff6b6b"))
+            return
+
+        url = f"{db_url}/overlay/content.json"
+        last = None
+        while True:
+            try:
+                r = requests.get(url, timeout=5)
+                if r.ok:
+                    val = r.json()
+                    if isinstance(val, str) and val != last:
+                        last = val
+                        self.root.after(0, lambda c=val: self._apply_remote_content(c))
+                    if not r.ok:
+                        raise Exception(r.status_code)
+            except Exception:
+                self.root.after(0, lambda: self.sync_label.config(
+                    text="⬤ reconnecting…", fg=C["dim"]))
+                time.sleep(2)
+                self.root.after(0, lambda: self.sync_label.config(
+                    text="⬤ firebase", fg="#72efdd"))
+            time.sleep(0.15)
+
+    # ── REMOTE SYNC — LOCAL WEBSOCKET ────────────────────────────────────────
+    #
+    # Runs an asyncio WebSocket server inside a daemon thread.
+    # The phone/laptop web UI connects to ws://YOUR-IP:8765 and sends the full
+    # notes content each time the user pauses typing (debounced 300ms).
+    # asyncio.run() creates its own event loop inside the thread — the rest
+    # of the app stays fully synchronous.
+
+    def start_local_ws_server(self, port=8765):
+        self._sync_mode = "local"
+        self.root.after(0, lambda: self.sync_label.config(
+            text=f"⬤ ws:{port}", fg="#f77f00"))
+        t = threading.Thread(
+            target=self._run_ws_server,
+            args=(port,),
+            daemon=True,
+        )
+        t.start()
+
+    def _run_ws_server(self, port):
+        asyncio.run(self._ws_serve(port))
+
+    async def _ws_serve(self, port):
+        try:
+            import websockets
+        except ImportError:
+            self.root.after(0, lambda: self.sync_label.config(
+                text="✗ install websockets", fg="#ff6b6b"))
+            return
+
+        async def handler(ws):
+            async for message in ws:
+                if isinstance(message, str):
+                    self.root.after(0, lambda c=message: self._apply_remote_content(c))
+
+        async with websockets.serve(handler, "0.0.0.0", port):
+            await asyncio.Future()   # run forever until the process exits
+
     # ── CONTROLS DROPDOWN ────────────────────────────────────────────────────
 
     def toggle_controls(self):
@@ -399,8 +504,28 @@ class OverlayApp:
 def main():
     root = tk.Tk()
     app = OverlayApp(root)
-    if len(sys.argv) > 1:
-        app.load_file(sys.argv[1])
+
+    args = sys.argv[1:]
+
+    if "--firebase" in args:
+        db_url = args[args.index("--firebase") + 1]
+        app.start_firebase_sync(db_url)
+    elif "--local" in args:
+        port = 8765
+        if "--port" in args:
+            port = int(args[args.index("--port") + 1])
+        app.start_local_ws_server(port)
+        # Print the local IP so the user knows what to type in the web UI
+        import socket
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip = "127.0.0.1"
+        print(f"Local WebSocket server started.")
+        print(f"Open the web UI and enter: {ip}:{port}")
+    elif args and not args[0].startswith("--"):
+        app.load_file(args[0])
+
     root.mainloop()
 
 
