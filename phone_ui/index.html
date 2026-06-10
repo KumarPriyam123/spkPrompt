@@ -1,310 +1,1076 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Overlay Notes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Presenter Pro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Serif:ital,wght@0,600;1,400&family=Public+Sans:wght@500;700&display=swap" rel="stylesheet" />
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+/* ── TOKENS ────────────────────────────────────────────────────────────────── */
+:root {
+  --bg:          #0d0e14;
+  --surface-1:   #14151d;
+  --surface-2:   #1b1c26;
+  --surface-3:   #232530;
+  --surface-4:   #2c2e3b;
+  --primary:     #b1c5ff;
+  --primary-btn: #4068e8;
+  --primary-btn-h: #3058d4;
+  --text-1:      #e4e3e8;
+  --text-2:      #8e93aa;
+  --text-3:      #525669;
+  --outline:     #252735;
+  --gold:        #d4b84a;
+  --red:         #ff5f56;
+  --green:       #2dce5c;
 
-    body {
-      background: #1a1b2e;
-      color: #d9d9e3;
-      font-family: "Segoe UI", system-ui, sans-serif;
-      height: 100dvh;
-      display: flex;
-      flex-direction: column;
-    }
+  --hl-h1:     #b1c5ff;
+  --hl-h2:     #8ba8f0;
+  --hl-bullet: #d4b84a;
+  --hl-bold:   #eae9ef;
+  --hl-body:   #c4c7d8;
+  --hl-prompt: #7ec97e;
 
-    header {
-      background: #252737;
-      padding: 10px 16px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      border-bottom: 1px solid #3d3f5c;
-      flex-shrink: 0;
-    }
+  --header-h: 50px;
+  --r-sm: 6px;  --r-md: 10px;  --r-xl: 20px;
+  --editor-w: 68%;            /* controlled by slider */
 
-    header h1 { font-size: 14px; font-weight: 600; color: #e0c3fc; flex: 1; }
+  --sans:  'Inter', system-ui, sans-serif;
+  --serif: 'Noto Serif', Georgia, serif;
+  --label: 'Public Sans', system-ui, sans-serif;
+}
 
-    .mode-toggle {
-      display: flex;
-      background: #1a1b2e;
-      border-radius: 6px;
-      padding: 3px;
-      gap: 2px;
-    }
-    .mode-btn {
-      padding: 4px 12px;
-      border: none;
-      border-radius: 4px;
-      font-size: 12px;
-      cursor: pointer;
-      background: transparent;
-      color: #6c6f93;
-      transition: all 0.15s;
-    }
-    .mode-btn.active { background: #3d3f5c; color: #e0c3fc; }
+[data-theme="light"] {
+  --bg:          #eef0f6;
+  --surface-1:   #ffffff;
+  --surface-2:   #f4f5f9;
+  --surface-3:   #eaecf3;
+  --surface-4:   #dfe2ed;
+  --primary:     #2a4fd6;
+  --primary-btn: #3558e0;
+  --primary-btn-h: #2748cc;
+  --text-1:      #16181f;
+  --text-2:      #565a74;
+  --text-3:      #9498b2;
+  --outline:     #d6d9e8;
+  --gold:        #8a6e00;
+  --hl-h1:     #2a4fd6;
+  --hl-h2:     #4068e8;
+  --hl-bullet: #8a6e00;
+  --hl-bold:   #16181f;
+  --hl-body:   #2e3044;
+  --hl-prompt: #2d6e2d;
+}
 
-    .status-dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      background: #3d3f5c;
-      flex-shrink: 0;
-      transition: background 0.3s;
-    }
-    .status-dot.connected  { background: #72efdd; }
-    .status-dot.error      { background: #ff6b6b; }
+/* ── RESET ──────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; }
+body {
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: var(--sans);
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow-x: hidden;
+}
+button { cursor: pointer; font-family: inherit; border: none; background: none; }
+input, textarea { font-family: inherit; }
 
-    /* ── PANELS ── */
-    .config-panel {
-      background: #252737;
-      padding: 12px 16px;
-      border-bottom: 1px solid #3d3f5c;
-      flex-shrink: 0;
-    }
-    .config-panel label {
-      font-size: 11px;
-      color: #6c6f93;
-      display: block;
-      margin-bottom: 5px;
-    }
-    .config-panel input {
-      width: 100%;
-      background: #1a1b2e;
-      border: 1px solid #3d3f5c;
-      color: #d9d9e3;
-      padding: 7px 10px;
-      border-radius: 6px;
-      font-size: 13px;
-      outline: none;
-    }
-    .config-panel input:focus { border-color: #e0c3fc; }
+/* ── AMBIENT GLOW ───────────────────────────────────────────────────────────── */
+body::before, body::after {
+  content: ''; position: fixed; border-radius: 50%;
+  pointer-events: none; z-index: 0;
+}
+body::before {
+  width: 60vw; height: 60vw; top: -10vw; left: -10vw;
+  background: radial-gradient(ellipse, rgba(64,104,232,.07) 0%, transparent 70%);
+  animation: driftA 18s ease-in-out infinite alternate;
+}
+body::after {
+  width: 50vw; height: 50vw; bottom: 5vw; right: -5vw;
+  background: radial-gradient(ellipse, rgba(177,197,255,.04) 0%, transparent 70%);
+  animation: driftB 22s ease-in-out infinite alternate;
+}
+@keyframes driftA {
+  0%   { transform: translate(0,0) scale(1);      opacity:.7 }
+  50%  { transform: translate(8vw,6vw) scale(1.15); opacity:1 }
+  100% { transform: translate(4vw,12vw) scale(.9); opacity:.5 }
+}
+@keyframes driftB {
+  0%   { transform: translate(0,0) scale(1);        opacity:.6 }
+  50%  { transform: translate(-6vw,-4vw) scale(1.2); opacity:1 }
+  100% { transform: translate(-10vw,4vw) scale(.85); opacity:.8 }
+}
 
-    .local-row { display: flex; gap: 8px; }
-    .local-row input { flex: 1; }
-    .local-row input:focus { border-color: #f77f00 !important; }
+/* ── HEADER ─────────────────────────────────────────────────────────────────── */
+header {
+  height: var(--header-h);
+  background: color-mix(in srgb, var(--surface-1) 85%, transparent);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--outline);
+  padding: 0 18px;
+  display: flex;
+  align-items: center;
+  position: sticky; top: 0; z-index: 200;
+}
 
-    .connect-btn {
-      padding: 7px 14px;
-      background: #f77f00;
-      color: white;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .connect-btn:hover { background: #e07000; }
+.logo {
+  display: flex; align-items: center; gap: 8px;
+  text-decoration: none; flex-shrink: 0;
+}
+.logo-mark {
+  width: 28px; height: 28px;
+  background: linear-gradient(135deg, var(--primary-btn), #6a8fff);
+  border-radius: var(--r-sm);
+  display: grid; place-items: center; font-size: 14px;
+  box-shadow: 0 2px 8px rgba(64,104,232,.35); flex-shrink: 0;
+}
+.logo-text {
+  font-family: var(--label); font-size: 12.5px; font-weight: 700;
+  letter-spacing: .06em; color: var(--text-1);
+}
 
-    /* ── NOTES AREA ── */
-    .notes-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+/* ── CENTER: width slider + word count — absolutely centred in header ── */
+.header-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex; align-items: center; gap: 20px;
+  pointer-events: auto;
+  white-space: nowrap;
+}
 
-    #notes {
-      flex: 1;
-      background: #252737;
-      color: #d9d9e3;
-      border: none;
-      outline: none;
-      padding: 16px;
-      font-size: 15px;
-      line-height: 1.65;
-      font-family: "Segoe UI", system-ui, monospace;
-      resize: none;
-    }
+/* Width slider control */
+.slider-control {
+  display: flex; align-items: center; gap: 8px;
+  position: relative;
+}
+.slider-icon {
+  color: var(--text-3); font-size: 12px; line-height: 1;
+  user-select: none; flex-shrink: 0;
+  font-family: var(--label); font-weight: 700;
+}
+.width-range {
+  -webkit-appearance: none; appearance: none;
+  width: 120px; height: 3px;
+  background: linear-gradient(to right, var(--primary) 0%, var(--primary) var(--pct, 56%), var(--outline) var(--pct, 56%));
+  border-radius: 2px; outline: none; cursor: pointer;
+}
+.width-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--primary); cursor: grab;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+  transition: box-shadow .15s, transform .15s;
+}
+.width-range::-webkit-slider-thumb:active {
+  transform: scale(1.2); cursor: grabbing;
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--primary) 25%, transparent);
+}
+.width-range::-moz-range-thumb {
+  width: 13px; height: 13px; border-radius: 50%; border: none;
+  background: var(--primary); cursor: grab;
+}
+/* Persistent label and value — always visible */
+.slider-lbl {
+  font-family: var(--label); font-size: 9px; font-weight: 700;
+  letter-spacing: .1em; color: var(--text-3); white-space: nowrap;
+}
+.slider-val {
+  font-family: var(--label); font-size: 10.5px; font-weight: 700;
+  color: var(--text-2); min-width: 3ch; text-align: left;
+  transition: color .2s;
+}
+.slider-control:hover .slider-val,
+.slider-control.dragging .slider-val { color: var(--primary); }
 
-    .hint {
-      background: #1a1b2e;
-      padding: 7px 16px;
-      font-size: 11px;
-      color: #3d3f5c;
-      text-align: center;
-      flex-shrink: 0;
-    }
+/* Word count badge */
+.wc-badge {
+  display: flex; align-items: baseline; gap: 4px;
+  background: var(--surface-2); border: 1px solid var(--outline);
+  border-radius: var(--r-md); padding: 0 11px; height: 28px;
+}
+.wc-num {
+  font-family: var(--label); font-size: 12.5px; font-weight: 700;
+  color: var(--text-1); min-width: 2ch; text-align: right;
+  transition: color .25s;
+}
+.wc-num.flash { color: var(--primary); }
+.wc-unit {
+  font-family: var(--label); font-size: 9px; font-weight: 700;
+  letter-spacing: .1em; color: var(--text-3);
+}
 
-    .hidden { display: none !important; }
+/* header right */
+.header-right { display: flex; align-items: center; gap: 4px; flex-shrink: 0; margin-left: auto; }
+.icon-btn {
+  width: 32px; height: 32px; border-radius: var(--r-sm);
+  color: var(--text-2); font-size: 15px;
+  display: grid; place-items: center;
+  transition: background .15s, color .15s;
+}
+.icon-btn:hover { background: var(--surface-3); color: var(--text-1); }
+
+/* ── MAIN ───────────────────────────────────────────────────────────────────── */
+main {
+  flex: 1; padding: 16px 18px 32px;
+  display: flex; flex-direction: column; gap: 12px;
+  position: relative; z-index: 1;
+}
+
+/* ── CARD BASE ──────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface-1);
+  border-radius: var(--r-xl);
+  border: 1px solid var(--outline);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   TOP SECTION  (connection + guide)
+   Collapses to a slim strip after connecting
+───────────────────────────────────────────────────────────────────────────── */
+
+/* slim strip (hidden while expanded) */
+.top-strip {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  background: var(--surface-1);
+  border: 1px solid var(--outline);
+  border-radius: var(--r-xl);
+  padding: 0 16px;
+  height: 44px;
+  cursor: pointer;
+  transition: background .15s;
+}
+.top-strip:hover { background: var(--surface-2); }
+.top-strip.visible { display: flex; }
+.strip-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-3); flex-shrink: 0;
+  transition: background .3s, box-shadow .3s;
+}
+.strip-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.strip-dot.error     { background: var(--red); }
+.strip-icon { font-size: 14px; }
+.strip-mode {
+  font-family: var(--label); font-size: 12px; font-weight: 700;
+  letter-spacing: .04em; color: var(--text-2);
+}
+.strip-status {
+  font-family: var(--label); font-size: 10px; font-weight: 700;
+  letter-spacing: .1em; color: var(--text-3); transition: color .3s;
+}
+.strip-status.connected { color: var(--green); }
+.strip-status.error     { color: var(--red); }
+.strip-expand {
+  margin-left: auto;
+  font-family: var(--label); font-size: 10px; font-weight: 700;
+  letter-spacing: .06em; color: var(--text-3);
+  padding: 3px 8px;
+  border: 1px solid var(--outline); border-radius: 4px;
+  transition: color .15s, border-color .15s;
+}
+.strip-expand:hover { color: var(--primary); border-color: var(--primary); }
+
+/* top grid (hidden when collapsed) */
+.top-section {
+  overflow: hidden;
+  max-height: 400px;
+  transition: max-height .4s cubic-bezier(.4,0,.2,1), opacity .3s, margin .3s;
+  opacity: 1;
+}
+.top-section.collapsed {
+  max-height: 0;
+  opacity: 0;
+  margin-bottom: -12px;  /* close the gap */
+}
+
+.top-grid {
+  display: grid;
+  grid-template-columns: 1fr 270px;
+  gap: 12px;
+  align-items: start;
+}
+
+/* ── CONNECTION CARD ────────────────────────────────────────────────────────── */
+.conn-head {
+  padding: 13px 16px 0;
+  display: flex; align-items: center; gap: 0;
+}
+.conn-tabs { display: flex; flex: 1; }
+.conn-tab {
+  font-family: var(--label); font-size: 11.5px; font-weight: 700;
+  letter-spacing: .04em; color: var(--text-3);
+  padding: 6px 12px 8px;
+  border-bottom: 2px solid transparent;
+  transition: color .15s, border-color .15s;
+}
+.conn-tab.active  { color: var(--text-1); border-bottom-color: var(--primary); }
+.conn-tab:hover:not(.active) { color: var(--text-2); }
+
+/* ? button inside connection card */
+.help-btn {
+  width: 24px; height: 24px; border-radius: 50%;
+  border: 1px solid var(--outline);
+  color: var(--text-3); font-family: var(--label);
+  font-size: 11px; font-weight: 700;
+  display: grid; place-items: center;
+  transition: color .15s, border-color .15s, background .15s;
+  flex-shrink: 0; margin-left: auto;
+}
+.help-btn:hover { color: var(--primary); border-color: var(--primary); background: color-mix(in srgb, var(--primary) 8%, transparent); }
+
+.conn-divider { height: 1px; background: var(--outline); margin: 0 16px; }
+
+.conn-body { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 9px; }
+
+.field-label {
+  display: block; font-family: var(--label);
+  font-size: 9.5px; font-weight: 700; letter-spacing: .12em;
+  color: var(--text-3); margin-bottom: 5px;
+}
+
+.text-input {
+  width: 100%;
+  background: var(--surface-2); border: 1.5px solid var(--outline);
+  border-radius: var(--r-md); color: var(--text-1);
+  padding: 9px 12px; font-size: 13.5px; outline: none;
+  transition: border-color .15s, background .15s;
+}
+.text-input::placeholder { color: var(--text-3); }
+.text-input:focus { border-color: var(--primary); background: var(--surface-1); }
+
+.connect-btn {
+  background: var(--primary-btn); color: #fff;
+  border-radius: var(--r-md); padding: 9px 16px;
+  font-family: var(--label); font-size: 12.5px; font-weight: 700;
+  letter-spacing: .04em; width: 100%;
+  transition: background .15s, transform .1s;
+  box-shadow: 0 2px 10px rgba(64,104,232,.3);
+}
+.connect-btn:hover  { background: var(--primary-btn-h); }
+.connect-btn:active { transform: scale(.98); }
+
+.hidden { display: none !important; }
+
+/* ── NOTES CARD ─────────────────────────────────────────────────────────────── */
+.notes-card {
+  display: flex; flex-direction: column;
+  transition: box-shadow .4s;
+}
+.notes-card.typing {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent),
+              0 12px 50px rgba(64,104,232,.10);
+}
+
+.notes-head {
+  padding: 13px 18px 12px;
+  display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid var(--outline);
+}
+.notes-icon {
+  width: 26px; height: 26px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border-radius: var(--r-sm); display: grid; place-items: center; font-size: 13px;
+}
+.notes-title {
+  font-family: var(--serif); font-size: 15.5px; font-weight: 600; color: var(--text-1);
+}
+.notes-head .help-btn { margin-left: auto; }
+
+/* ── SLIDE TABS ─────────────────────────────────────────────────────────────── */
+.slide-tabs-wrap {
+  display: flex; align-items: flex-end; gap: 2px;
+  padding: 8px 13px 0;
+  border-bottom: 1px solid var(--outline);
+  overflow-x: auto; scrollbar-width: none;
+}
+.slide-tabs-wrap::-webkit-scrollbar { display: none; }
+
+.slide-tab {
+  display: flex; align-items: center; gap: 4px;
+  padding: 5px 10px 6px;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  color: var(--text-3); font-family: var(--label);
+  font-size: 11px; font-weight: 700; letter-spacing: .03em;
+  white-space: nowrap; border-bottom: 2px solid transparent;
+  transition: color .15s, background .15s;
+}
+.slide-tab:hover:not(.active) { color: var(--text-2); background: var(--surface-2); }
+.slide-tab.active {
+  color: var(--primary); border-bottom-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
+}
+.tab-close {
+  width: 12px; height: 12px; border-radius: 3px;
+  color: var(--text-3); font-size: 8px;
+  display: grid; place-items: center;
+  transition: background .15s, color .15s;
+}
+.tab-close:hover { background: color-mix(in srgb, var(--red) 20%, transparent); color: var(--red); }
+.add-slide-tab {
+  padding: 5px 9px 6px; color: var(--text-3); font-size: 17px; line-height: 1;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  display: grid; place-items: center;
+  transition: color .15s, background .15s;
+}
+.add-slide-tab:hover { color: var(--primary); background: var(--surface-2); }
+
+/* ── NOTES BODY ─────────────────────────────────────────────────────────────── */
+.notes-body { display: flex; align-items: flex-start; }
+
+/* ── LEFT STICKY TOOLBAR ────────────────────────────────────────────────────── */
+.left-toolbar {
+  width: 44px; flex-shrink: 0;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 2px; padding: 12px 5px;
+  border-right: 1px solid var(--outline);
+  background: var(--surface-2);
+  border-radius: 0 0 0 var(--r-xl);
+  position: sticky; top: calc(var(--header-h) + 8px);
+}
+.tool-btn {
+  width: 33px; height: 33px; border-radius: var(--r-sm);
+  color: var(--text-2); font-family: var(--label);
+  font-size: 11px; font-weight: 700; letter-spacing: .02em;
+  display: grid; place-items: center;
+  transition: background .15s, color .15s, transform .1s;
+  position: relative;
+}
+.tool-btn:hover { background: var(--surface-4); color: var(--text-1); }
+.tool-btn:active { transform: scale(.88); }
+.tool-btn::after {
+  content: attr(data-tip);
+  position: absolute; left: calc(100% + 9px); top: 50%; transform: translateY(-50%);
+  background: var(--surface-4); border: 1px solid var(--outline);
+  color: var(--text-1); font-family: var(--label);
+  font-size: 9px; font-weight: 700; letter-spacing: .07em;
+  padding: 3px 8px; border-radius: var(--r-sm);
+  white-space: nowrap; pointer-events: none; opacity: 0;
+  transition: opacity .15s; z-index: 50;
+}
+.tool-btn:hover::after { opacity: 1; }
+.tool-sep { width: 18px; height: 1px; background: var(--outline); margin: 3px 0; flex-shrink: 0; }
+
+/* ── EDITOR OUTER (fills remaining width) ───────────────────────────────────── */
+.editor-outer {
+  flex: 1; min-width: 0;
+  display: flex; justify-content: center;
+  background: var(--surface-2);
+  border-radius: 0 0 var(--r-xl) 0;
+}
+
+/* Writing column — width controlled by CSS var set from slider */
+.editor-col {
+  width: var(--editor-w);
+  max-width: 100%;
+  display: grid;          /* pre + textarea share same grid cell */
+  min-height: 380px;
+}
+.editor-col > * {
+  grid-area: 1 / 1;
+  font-family: var(--sans); font-size: 15.5px; line-height: 1.9;
+  padding: 20px 26px;
+  border: none; outline: none;
+  white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word;
+  tab-size: 2; background: transparent;
+}
+.hl-layer {
+  pointer-events: none; user-select: none;
+  color: var(--hl-body); margin: 0; overflow: hidden;
+}
+.editor-ta {
+  color: transparent; -webkit-text-fill-color: transparent;
+  caret-color: var(--text-1); resize: none; overflow: hidden; z-index: 1;
+}
+.editor-ta::selection { background: color-mix(in srgb, var(--primary) 28%, transparent); }
+
+/* Highlight classes */
+.hl-h1     { color: var(--hl-h1);     font-weight: 700; }
+.hl-h2     { color: var(--hl-h2);     font-weight: 600; }
+.hl-bullet { color: var(--hl-bullet); }
+.hl-prompt { color: var(--hl-prompt); font-style: italic; }
+.hl-bold   { color: var(--hl-bold);   font-weight: 700; }
+.hl-body   { color: var(--hl-body); }
+
+/* ── NOTES FOOTER ────────────────────────────────────────────────────────────── */
+.notes-footer {
+  padding: 9px 16px 9px 60px;
+  border-top: 1px solid var(--outline);
+  display: flex; align-items: center; gap: 10px;
+}
+.new-slide-btn {
+  display: flex; align-items: center; gap: 5px;
+  background: var(--surface-3); border-radius: var(--r-sm);
+  color: var(--text-1); font-family: var(--label);
+  font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  padding: 5px 12px;
+  transition: background .15s, color .15s;
+}
+.new-slide-btn:hover { background: var(--surface-4); color: var(--primary); }
+.footer-progress { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; }
+.progress-lbl { font-family: var(--label); font-size: 8.5px; font-weight: 700; letter-spacing: .14em; color: var(--text-3); }
+.progress-val { font-family: var(--label); font-size: 14px; font-weight: 700; color: var(--text-2); line-height: 1.2; }
+
+/* ── FLOATING POPOVER ────────────────────────────────────────────────────────── */
+.popover {
+  position: fixed; z-index: 600;
+  background: var(--surface-1);
+  border: 1px solid var(--outline);
+  border-radius: var(--r-xl);
+  box-shadow: 0 8px 32px rgba(0,0,0,.4), 0 2px 8px rgba(0,0,0,.2);
+  padding: 16px 18px;
+  min-width: 230px; max-width: 290px;
+  animation: popIn .15s cubic-bezier(.2,0,.2,1.4);
+}
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(-6px) scale(.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.popover-title {
+  font-family: var(--label); font-size: 9.5px; font-weight: 700;
+  letter-spacing: .14em; color: var(--text-3); margin-bottom: 12px;
+}
+.pop-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.pop-list li {
+  font-size: 12.5px; color: var(--text-2); line-height: 1.5;
+  display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap;
+}
+.chip {
+  display: inline-block; background: var(--surface-3); color: var(--primary);
+  font-family: 'Courier New', monospace; font-size: 11px; font-weight: 600;
+  padding: 2px 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0;
+}
+.chip.gold  { color: var(--gold); }
+.chip.green { color: var(--hl-prompt); }
+
+/* firebase guide */
+.pop-steps { display: flex; flex-direction: column; gap: 9px; }
+.pop-step { display: flex; gap: 10px; align-items: flex-start; }
+.step-num {
+  width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary); font-family: var(--label);
+  font-size: 9.5px; font-weight: 700;
+  display: grid; place-items: center; margin-top: 1px;
+}
+.step-txt { font-size: 12px; color: var(--text-2); line-height: 1.5; }
+.step-txt a { color: var(--primary); text-decoration: none; }
+.step-txt a:hover { text-decoration: underline; }
+.pop-note {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--outline);
+  font-size: 11px; color: var(--text-3); line-height: 1.5;
+}
+
+/* ── RESPONSIVE ──────────────────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  header { padding: 0 12px; gap: 8px; }
+  .logo-text { display: none; }
+  .slider-control { width: 90px; }
+  .width-range { width: 80px; }
+  main { padding: 12px 12px 28px; gap: 10px; }
+  .top-grid { grid-template-columns: 1fr; }
+  .editor-col > * { padding: 16px; font-size: 15px; }
+  .notes-footer { padding-left: 56px; }
+  .tool-btn::after { display: none; }
+}
   </style>
 </head>
 <body>
 
+<!-- ══ HEADER ════════════════════════════════════════════════════════════════ -->
 <header>
-  <h1>Overlay Notes</h1>
-  <div class="mode-toggle">
-    <button class="mode-btn active" id="btn-firebase" onclick="setMode('firebase')">Firebase</button>
-    <button class="mode-btn"        id="btn-local"    onclick="setMode('local')">Local</button>
+  <div class="logo">
+    <div class="logo-mark">📖</div>
+    <span class="logo-text">PRESENTER PRO</span>
   </div>
-  <div class="status-dot" id="dot"></div>
+
+  <div class="header-center">
+    <!-- Width slider — subtle, shows value only while dragging -->
+    <div class="slider-control" id="slider-ctl">
+      <span class="slider-lbl">COLUMN</span>
+      <span class="slider-icon">◂▸</span>
+      <input type="range" class="width-range" id="width-range"
+             min="36" max="100" value="68" />
+      <span class="slider-val" id="slider-tip">68%</span>
+    </div>
+
+    <!-- Word count -->
+    <div class="wc-badge">
+      <span class="wc-num" id="wc-num">0</span>
+      <span class="wc-unit">WORDS</span>
+    </div>
+  </div>
+
+  <div class="header-right">
+    <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+  </div>
 </header>
 
-<!-- Firebase panel -->
-<div class="config-panel" id="firebase-panel">
-  <label>Firebase Database URL</label>
-  <input type="url" id="fb-url"
-         placeholder="https://your-project-default-rtdb.firebaseio.com" />
-</div>
+<!-- ══ MAIN ══════════════════════════════════════════════════════════════════ -->
+<main>
 
-<!-- Local WS panel -->
-<div class="config-panel hidden" id="local-panel">
-  <label>Overlay laptop  IP : port</label>
-  <div class="local-row">
-    <input type="text" id="ws-addr" placeholder="192.168.1.42:8765" />
-    <button class="connect-btn" onclick="connectWS()">Connect</button>
+  <!-- Slim strip (visible when collapsed) -->
+  <div class="top-strip" id="top-strip" onclick="expandTop()">
+    <span class="strip-icon" id="strip-icon">☁</span>
+    <span class="strip-mode" id="strip-mode">Firebase</span>
+    <div class="strip-dot" id="strip-dot"></div>
+    <span class="strip-status" id="strip-status">DISCONNECTED</span>
+    <button class="strip-expand">▲ Settings</button>
   </div>
-</div>
 
-<div class="notes-wrap">
-  <textarea id="notes"
-    placeholder="Type your notes here.
+  <!-- Full top section -->
+  <div class="top-section" id="top-section">
+    <div class="top-grid">
 
-Use  ---  on its own line to separate slides.
-Use  #  for headings,  ##  for subheadings.
-Use  **text**  for bold.
-Use  -  for bullet points."></textarea>
-  <div class="hint">Saves automatically · use  ---  to separate slides</div>
-</div>
+      <!-- Connection card -->
+      <div class="card">
+        <div class="conn-head">
+          <div class="conn-tabs">
+            <button class="conn-tab active" id="tab-cloud" onclick="setMode('firebase')">Cloud (Firebase)</button>
+            <button class="conn-tab"        id="tab-local" onclick="setMode('local')">Local Bridge</button>
+          </div>
+          <button class="help-btn" id="conn-help-btn" title="How to connect">?</button>
+        </div>
+        <div class="conn-divider"></div>
+
+        <div class="conn-body" id="cloud-panel">
+          <div>
+            <span class="field-label">FIREBASE DATABASE URL</span>
+            <input type="url" class="text-input" id="fb-url"
+                   placeholder="https://your-project-default-rtdb.firebaseio.com"
+                   autocomplete="off" spellcheck="false" />
+          </div>
+          <button class="connect-btn" onclick="fbConnect()">Establish Connection</button>
+        </div>
+
+        <div class="conn-body hidden" id="local-panel">
+          <div>
+            <span class="field-label">LOCAL ADDRESS (IP:PORT)</span>
+            <input type="text" class="text-input" id="ws-addr"
+                   placeholder="192.168.1.42:8765"
+                   autocomplete="off" spellcheck="false" />
+          </div>
+          <button class="connect-btn" onclick="connectWS()">Establish Connection</button>
+        </div>
+      </div>
+
+      <!-- Instructions / guide card replaced by ? popup — show a minimal placeholder -->
+      <div class="card" style="padding:18px 18px; display:flex; flex-direction:column; gap:10px;">
+        <div style="font-family:var(--label);font-size:9.5px;font-weight:700;letter-spacing:.14em;color:var(--text-3)">QUICK REFERENCE</div>
+        <p style="font-size:12.5px;color:var(--text-2);line-height:1.6">
+          Type your notes in the editor below.<br>
+          Use slide tabs to navigate between slides.<br>
+          The overlay on your laptop updates in real-time.
+        </p>
+        <p style="font-size:11.5px;color:var(--text-3);line-height:1.5;margin-top:4px">
+          Click <b style="color:var(--text-2)">?</b> in the notes panel for formatting syntax.<br>
+          Click <b style="color:var(--text-2)">?</b> in the connection panel for setup help.
+        </p>
+      </div>
+
+    </div>
+  </div><!-- /top-section -->
+
+  <!-- NOTES CARD -->
+  <div class="card notes-card" id="notes-card">
+
+    <div class="notes-head">
+      <div class="notes-icon">🗒</div>
+      <span class="notes-title">Speaker Notes</span>
+      <button class="help-btn" id="notes-help-btn" title="Syntax guide">?</button>
+    </div>
+
+    <div class="slide-tabs-wrap" id="slide-tabs"></div>
+
+    <div class="notes-body">
+      <div class="left-toolbar">
+        <button class="tool-btn" onclick="insertHeading(1)" data-tip="HEADING 1">H1</button>
+        <button class="tool-btn" onclick="insertHeading(2)" data-tip="HEADING 2">H2</button>
+        <button class="tool-btn" onclick="insertBold()"     data-tip="BOLD"><b>B</b></button>
+        <div class="tool-sep"></div>
+        <button class="tool-btn" onclick="insertBullet()"   data-tip="BULLET">≡</button>
+        <button class="tool-btn" onclick="insertPrompt()"   data-tip="PROMPT" style="font-size:15px">›</button>
+      </div>
+
+      <div class="editor-outer">
+        <div class="editor-col" id="editor-col">
+          <pre class="hl-layer" id="hl-layer" aria-hidden="true"></pre>
+          <textarea class="editor-ta" id="editor"
+                    spellcheck="true"
+                    placeholder="Begin articulating your vision here…"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="notes-footer">
+      <button class="new-slide-btn" onclick="addSlide()">＋  NEW SLIDE</button>
+      <div class="footer-progress">
+        <span class="progress-lbl">SLIDE PROGRESS</span>
+        <span class="progress-val" id="slide-counter">1 / 1</span>
+      </div>
+    </div>
+
+  </div><!-- /notes-card -->
+
+</main>
 
 <script>
-// ─────────────────────────────────────────────────────────────────────────────
-// HOW THIS WORKS
-//
-// Firebase mode  — uses the Firebase Realtime Database REST API directly.
-//   No SDK, no API key needed while test mode rules are active.
-//   REST API is just two HTTP calls:
-//     GET  /overlay/content.json          → read current value
-//     PUT  /overlay/content.json  + body  → write new value
-//
-// Local mode — connects a WebSocket to the Python overlay server running on
-//   your LAN. The overlay runs 'python overlay.py --local' which starts
-//   a WebSocket server on port 8765. You type here → WS message → overlay.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── STATE ─────────────────────────────────────────────────────────────────────
+let slides = [""], currentSlide = 0, mode = "firebase";
+let ws = null, debounceTimer = null, typingTimer = null;
+let topCollapsed = false;
 
-const dot      = document.getElementById("dot");
-const textarea = document.getElementById("notes");
+const editor       = document.getElementById("editor");
+const hlLayer      = document.getElementById("hl-layer");
+const slideTabsEl  = document.getElementById("slide-tabs");
+const slideCounter = document.getElementById("slide-counter");
+const wcNum        = document.getElementById("wc-num");
+const notesCard    = document.getElementById("notes-card");
+const topSection   = document.getElementById("top-section");
+const topStrip     = document.getElementById("top-strip");
+const editorCol    = document.getElementById("editor-col");
 
-let mode     = "firebase";
-let ws       = null;
-let debounce = null;
+// ── WIDTH SLIDER ──────────────────────────────────────────────────────────────
+const widthRange  = document.getElementById("width-range");
+const sliderCtl   = document.getElementById("slider-ctl");
+const sliderTip   = document.getElementById("slider-tip");
 
-
-// ── STATUS DOT ───────────────────────────────────────────────────────────────
-
-function setDot(state) {
-  dot.className = "status-dot" +
-    (state === "connected"  ? " connected" :
-     state === "error"      ? " error"     : "");
+function applyWidth(v) {
+  const pct = v + "%";
+  document.documentElement.style.setProperty("--editor-w", pct);
+  // fill track up to thumb
+  const rel = ((v - widthRange.min) / (widthRange.max - widthRange.min) * 100).toFixed(1);
+  widthRange.style.setProperty("--pct", rel + "%");
+  sliderTip.textContent = v + "%";
+  localStorage.setItem("overlay-editor-w", v);
 }
 
+widthRange.addEventListener("mousedown",  () => sliderCtl.classList.add("dragging"));
+widthRange.addEventListener("touchstart", () => sliderCtl.classList.add("dragging"), {passive:true});
+widthRange.addEventListener("mouseup",    () => sliderCtl.classList.remove("dragging"));
+widthRange.addEventListener("touchend",   () => sliderCtl.classList.remove("dragging"));
+widthRange.addEventListener("input", () => applyWidth(+widthRange.value));
 
-// ── MODE TOGGLE ──────────────────────────────────────────────────────────────
+const savedW = localStorage.getItem("overlay-editor-w");
+if (savedW) { widthRange.value = savedW; }
+applyWidth(+widthRange.value);
 
+// ── COLLAPSE / EXPAND TOP ─────────────────────────────────────────────────────
+function collapseTop() {
+  topCollapsed = true;
+  topSection.classList.add("collapsed");
+  topStrip.classList.add("visible");
+}
+function expandTop() {
+  topCollapsed = false;
+  topSection.classList.remove("collapsed");
+  topStrip.classList.remove("visible");
+}
+
+// ── STATUS ────────────────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  const label = text || (state==="connected"?"CONNECTED":state==="error"?"ERROR":"DISCONNECTED");
+  // strip
+  ["strip-dot","strip-status"].forEach((id,i) => {
+    const el = document.getElementById(id);
+    el.className = (i===0?"strip-dot":"strip-status") + (state?" "+state:"");
+  });
+  document.getElementById("strip-status").textContent = label;
+}
+function setModeLabel(m) {
+  document.getElementById("strip-icon").textContent = m==="local"?"📡":"☁";
+  document.getElementById("strip-mode").textContent = m==="local"?"Local Bridge":"Firebase";
+}
+
+// ── THEME ─────────────────────────────────────────────────────────────────────
+let isDark = localStorage.getItem("overlay-theme") !== "light";
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", isDark?"dark":"light");
+  document.getElementById("theme-btn").textContent = isDark?"🌙":"☀️";
+}
+function toggleTheme() { isDark=!isDark; localStorage.setItem("overlay-theme",isDark?"dark":"light"); applyTheme(); }
+applyTheme();
+
+// ── MODE ──────────────────────────────────────────────────────────────────────
 function setMode(m) {
   mode = m;
-  document.getElementById("btn-firebase").classList.toggle("active", m === "firebase");
-  document.getElementById("btn-local").classList.toggle("active", m === "local");
-  document.getElementById("firebase-panel").classList.toggle("hidden", m !== "firebase");
-  document.getElementById("local-panel").classList.toggle("hidden", m !== "local");
-  setDot("disconnected");
-  if (m === "local") disconnectWS();
+  document.getElementById("tab-cloud").classList.toggle("active", m==="firebase");
+  document.getElementById("tab-local").classList.toggle("active", m==="local");
+  document.getElementById("cloud-panel").classList.toggle("hidden", m!=="firebase");
+  document.getElementById("local-panel").classList.toggle("hidden", m!=="local");
+  setStatus("","DISCONNECTED"); setModeLabel(m);
+  if (m==="local") disconnectWS();
   localStorage.setItem("overlay-mode", m);
 }
 
-
-// ── FIREBASE MODE — plain fetch() against the REST API ───────────────────────
-//
-// Firebase RTDB exposes every node as a URL ending in .json
-// With test mode rules (.read=true, .write=true) no auth header is needed.
-//
-// Reading:  GET  https://<db-url>/overlay/content.json
-//           Response body: a JSON-encoded string, e.g. "\"hello\""
-//
-// Writing:  PUT  https://<db-url>/overlay/content.json
-//           Body: JSON.stringify(text)  →  "\"your notes text\""
-
-function getDbUrl() {
-  return document.getElementById("fb-url").value.trim().replace(/\/$/, "");
+// ── SLIDES ────────────────────────────────────────────────────────────────────
+function saveCurrentSlide()  { slides[currentSlide] = editor.value; }
+function goToSlide(i) {
+  if (i===currentSlide) return;
+  saveCurrentSlide(); currentSlide=i; editor.value=slides[currentSlide];
+  updateAll(); editor.focus();
+}
+function addSlide() {
+  saveCurrentSlide(); slides.splice(currentSlide+1,0,""); currentSlide++;
+  editor.value=""; updateAll(); editor.focus(); scheduleSync();
+}
+function deleteSlide(i,event) {
+  event.stopPropagation();
+  if (slides.length===1) { slides[0]=""; editor.value=""; updateAll(); scheduleSync(); return; }
+  slides.splice(i,1); currentSlide=Math.min(currentSlide,slides.length-1);
+  editor.value=slides[currentSlide]; updateAll(); scheduleSync();
+}
+function updateAll() { updateHighlight(); renderTabs(); updateStats(); }
+function updateStats() {
+  const n=currentSlide+1, t=slides.length;
+  slideCounter.textContent=`${n} / ${t}`;
+  const w=(editor.value.trim().match(/\S+/g)||[]).length;
+  wcNum.textContent=w;
+}
+function renderTabs() {
+  slideTabsEl.innerHTML="";
+  slides.forEach((s,i)=>{
+    const btn=document.createElement("button");
+    btn.className="slide-tab"+(i===currentSlide?" active":"");
+    const m=s.match(/^#+\s+(.+)/m);
+    btn.textContent=`${i+1}. ${m?m[1].slice(0,20):"Slide "+(i+1)}`;
+    btn.onclick=()=>goToSlide(i);
+    const del=document.createElement("button");
+    del.className="tab-close"; del.textContent="✕"; del.title="Remove";
+    del.onclick=(e)=>deleteSlide(i,e);
+    btn.appendChild(del); slideTabsEl.appendChild(btn);
+  });
+  const add=document.createElement("button");
+  add.className="add-slide-tab"; add.textContent="+"; add.title="Add slide";
+  add.onclick=addSlide; slideTabsEl.appendChild(add);
+  const active=slideTabsEl.querySelector(".slide-tab.active");
+  if(active) active.scrollIntoView({behavior:"smooth",inline:"nearest",block:"nearest"});
+}
+function loadContent(text) {
+  const parts=text.split(/\n---\n/).map(s=>s.trim());
+  slides=parts.filter((s,i)=>s!==""||i===0);
+  if(!slides.length) slides=[""];
+  currentSlide=Math.min(currentSlide,slides.length-1);
+  editor.value=slides[currentSlide]; updateAll();
 }
 
-async function fbLoad() {
-  const url = getDbUrl();
-  if (!url) return;
-  try {
-    const r = await fetch(`${url}/overlay/content.json`);
-    if (!r.ok) throw new Error(r.status);
-    const val = await r.json();           // Firebase returns JSON — a string or null
-    if (typeof val === "string") textarea.value = val;
-    setDot("connected");
-    localStorage.setItem("overlay-fb-url", url);
-  } catch(e) {
-    setDot("error");
+// ── HIGHLIGHT ─────────────────────────────────────────────────────────────────
+function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function highlightLine(r) {
+  const e=esc(r);
+  if(/^# /.test(r))    return `<span class="hl-h1">${e}</span>`;
+  if(/^## /.test(r))   return `<span class="hl-h2">${e}</span>`;
+  if(/^[-*] /.test(r)) return `<span class="hl-bullet">${e}</span>`;
+  if(/^> /.test(r))    return `<span class="hl-prompt">${e}</span>`;
+  const b=e.replace(/\*\*(.+?)\*\*/g,'<span class="hl-bold">**$1**</span>');
+  return `<span class="hl-body">${b}</span>`;
+}
+function updateHighlight() {
+  hlLayer.innerHTML=editor.value.split("\n").map(highlightLine).join("\n")+"\n";
+}
+editor.addEventListener("scroll",()=>{ hlLayer.scrollTop=editor.scrollTop; hlLayer.scrollLeft=editor.scrollLeft; });
+
+// ── TYPING GLOW ───────────────────────────────────────────────────────────────
+editor.addEventListener("focus",()=>notesCard.classList.add("typing"));
+editor.addEventListener("blur", ()=>{ clearTimeout(typingTimer); typingTimer=setTimeout(()=>notesCard.classList.remove("typing"),1800); });
+
+// ── SMART PASTE ───────────────────────────────────────────────────────────────
+function nodeToMd(node) {
+  if(node.nodeType===Node.TEXT_NODE) return node.textContent;
+  const tag=(node.tagName||"").toLowerCase();
+  const kids=[...node.childNodes].map(nodeToMd).join("");
+  switch(tag){
+    case"b":case"strong": return`**${kids}**`;
+    case"i":case"em":     return`*${kids}*`;
+    case"h1":             return`# ${kids.trim()}\n\n`;
+    case"h2":             return`## ${kids.trim()}\n\n`;
+    case"h3":case"h4":case"h5": return`## ${kids.trim()}\n\n`;
+    case"li":             return`- ${kids.trim()}\n`;
+    case"ul":case"ol":    return kids+"\n";
+    case"p":  return kids.trim()?kids.trim()+"\n\n":"";
+    case"div":return kids.trim()?kids.trim()+"\n":"";
+    case"br": return"\n";
+    default:  return kids;
   }
 }
+editor.addEventListener("paste",e=>{
+  const html=e.clipboardData.getData("text/html"); if(!html) return;
+  e.preventDefault();
+  const div=document.createElement("div"); div.innerHTML=html;
+  const md=nodeToMd(div).replace(/\n{3,}/g,"\n\n").trim();
+  const s=editor.selectionStart,end=editor.selectionEnd;
+  editor.value=editor.value.slice(0,s)+md+editor.value.slice(end);
+  editor.selectionStart=editor.selectionEnd=s+md.length;
+  saveCurrentSlide(); updateAll(); scheduleSync();
+});
 
-async function fbWrite(text) {
-  const url = getDbUrl();
-  if (!url) return;
-  try {
-    const r = await fetch(`${url}/overlay/content.json`, {
-      method:  "PUT",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(text),       // wraps the string in JSON quotes
+// ── TOOLBAR ───────────────────────────────────────────────────────────────────
+function insertAtLineStart(prefix) {
+  const s=editor.selectionStart, val=editor.value;
+  const ls=val.lastIndexOf("\n",s-1)+1;
+  if(val.slice(ls).startsWith(prefix)){
+    editor.value=val.slice(0,ls)+val.slice(ls+prefix.length);
+    editor.selectionStart=editor.selectionEnd=Math.max(ls,s-prefix.length);
+  } else {
+    editor.value=val.slice(0,ls)+prefix+val.slice(ls);
+    editor.selectionStart=editor.selectionEnd=s+prefix.length;
+  }
+  saveCurrentSlide(); updateAll(); scheduleSync(); editor.focus();
+}
+function insertBold() {
+  const s=editor.selectionStart,e2=editor.selectionEnd,val=editor.value;
+  const sel=val.slice(s,e2)||"bold text";
+  editor.value=val.slice(0,s)+`**${sel}**`+val.slice(e2);
+  editor.selectionStart=s+2; editor.selectionEnd=s+2+sel.length;
+  saveCurrentSlide(); updateAll(); scheduleSync(); editor.focus();
+}
+function insertHeading(n) { insertAtLineStart("#".repeat(n)+" "); }
+function insertBullet()   { insertAtLineStart("- "); }
+function insertPrompt()   { insertAtLineStart("> "); }
+
+editor.addEventListener("input",()=>{ saveCurrentSlide(); updateAll(); scheduleSync(); });
+
+// ── SYNC ──────────────────────────────────────────────────────────────────────
+function scheduleSync() {
+  clearTimeout(debounceTimer);
+  debounceTimer=setTimeout(()=>{
+    const text=slides.join("\n---\n");
+    if     (mode==="firebase"&&getDbUrl()) fbWrite(text);
+    else if(mode==="local"&&ws?.readyState===WebSocket.OPEN) ws.send(text);
+  },150);
+}
+
+// ── FIREBASE ──────────────────────────────────────────────────────────────────
+function getDbUrl(){ return document.getElementById("fb-url").value.trim().replace(/\/$/,""); }
+async function fbConnect(){
+  const url=getDbUrl(); if(!url) return;
+  setStatus("","CONNECTING…");
+  try{
+    const r=await fetch(`${url}/overlay/content.json`);
+    if(!r.ok) throw new Error(r.status);
+    const val=await r.json();
+    if(typeof val==="string"&&val) loadContent(val);
+    setStatus("connected");
+    localStorage.setItem("overlay-fb-url",url);
+    setTimeout(collapseTop, 900);
+  } catch { setStatus("error","FAILED"); }
+}
+async function fbWrite(text){
+  const url=getDbUrl(); if(!url) return;
+  try{
+    const r=await fetch(`${url}/overlay/content.json`,{
+      method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(text)
     });
-    if (!r.ok) throw new Error(r.status);
-    setDot("connected");
-  } catch(e) {
-    setDot("error");
+    if(!r.ok) throw new Error(r.status);
+    setStatus("connected");
+  } catch { setStatus("error","WRITE FAILED"); }
+}
+document.getElementById("fb-url").addEventListener("keydown",e=>{ if(e.key==="Enter") fbConnect(); });
+
+// ── LOCAL WS ──────────────────────────────────────────────────────────────────
+function connectWS(){
+  const addr=document.getElementById("ws-addr").value.trim(); if(!addr) return;
+  disconnectWS(); localStorage.setItem("overlay-ws-addr",addr); setStatus("","CONNECTING…");
+  try{
+    ws=new WebSocket(`ws://${addr}`);
+    ws.onopen   =()=>{ setStatus("connected"); setTimeout(collapseTop,900); };
+    ws.onclose  =()=>{ setStatus("","DISCONNECTED"); ws=null; };
+    ws.onerror  =()=>setStatus("error","FAILED");
+    ws.onmessage=ev=>{ if(ev.data!==slides.join("\n---\n")) loadContent(ev.data); };
+  } catch { setStatus("error","FAILED"); }
+}
+function disconnectWS(){ if(ws){ ws.close(); ws=null; } }
+document.getElementById("ws-addr").addEventListener("keydown",e=>{ if(e.key==="Enter") connectWS(); });
+
+// ── POPOVERS ──────────────────────────────────────────────────────────────────
+const POPOVER_CONTENT = {
+  "notes-pop": `
+    <div class="popover-title">SYNTAX GUIDE</div>
+    <ul class="pop-list">
+      <li><span class="chip">#</span> Heading 1</li>
+      <li><span class="chip">##</span> Heading 2 / subheading</li>
+      <li><span class="chip">**text**</span> Bold inline</li>
+      <li><span class="chip gold">- item</span> Bullet point</li>
+      <li><span class="chip green">&gt; text</span> Speaker prompt box — shows as a highlighted callout in the overlay</li>
+      <li><span class="chip">⌘V</span> Paste from Word / Docs — formatting auto-converts</li>
+    </ul>`,
+  "conn-pop": `
+    <div class="popover-title">FIREBASE SETUP GUIDE</div>
+    <div class="pop-steps">
+      <div class="pop-step">
+        <div class="step-num">1</div>
+        <div class="step-txt">Go to <a href="https://console.firebase.google.com" target="_blank">console.firebase.google.com</a> and create a new project.</div>
+      </div>
+      <div class="pop-step">
+        <div class="step-num">2</div>
+        <div class="step-txt">In the left sidebar: <b>Build → Realtime Database → Create Database</b>. Choose any region, select <b>Start in test mode</b>.</div>
+      </div>
+      <div class="pop-step">
+        <div class="step-num">3</div>
+        <div class="step-txt">Copy the database URL shown at the top — it looks like:<br><span style="font-family:monospace;font-size:11px;color:var(--primary)">https://your-app-default-rtdb.firebaseio.com</span></div>
+      </div>
+      <div class="pop-step">
+        <div class="step-num">4</div>
+        <div class="step-txt">Paste the URL above and click <b>Establish Connection</b>.</div>
+      </div>
+    </div>
+    <div class="pop-note">Test mode rules expire after 30 days. Renew in Firebase → Rules if the connection stops working.</div>`
+};
+
+function togglePopover(btnEl, id) {
+  const existing = document.getElementById("active-popover");
+  if (existing) {
+    const wasThis = existing.dataset.id === id;
+    existing.remove();
+    if (wasThis) return;   // same button → just close
   }
-}
 
-// Test the connection when the URL field loses focus or Enter is pressed
-document.getElementById("fb-url").addEventListener("change", fbLoad);
-document.getElementById("fb-url").addEventListener("keydown", e => {
-  if (e.key === "Enter") fbLoad();
-});
+  const rect = btnEl.getBoundingClientRect();
+  const pop  = document.createElement("div");
+  pop.id        = "active-popover";
+  pop.dataset.id = id;
+  pop.className = "popover";
+  pop.innerHTML = POPOVER_CONTENT[id] || "";
 
+  // Set each property individually — don't rely on cssText
+  pop.style.position = "fixed";
+  pop.style.zIndex   = "600";
+  pop.style.top      = (rect.bottom + 8) + "px";
+  pop.style.right    = Math.max(8, window.innerWidth - rect.right) + "px";
 
-// ── LOCAL WEBSOCKET MODE ─────────────────────────────────────────────────────
+  document.body.appendChild(pop);
 
-function connectWS() {
-  const addr = document.getElementById("ws-addr").value.trim();
-  if (!addr) return;
-  disconnectWS();
-  localStorage.setItem("overlay-ws-addr", addr);
-  try {
-    ws = new WebSocket(`ws://${addr}`);
-    ws.onopen    = () => setDot("connected");
-    ws.onclose   = () => { setDot("disconnected"); ws = null; };
-    ws.onerror   = () => setDot("error");
-    ws.onmessage = e  => { if (e.data !== textarea.value) textarea.value = e.data; };
-  } catch(e) { setDot("error"); }
-}
-
-function disconnectWS() {
-  if (ws) { ws.close(); ws = null; }
-}
-
-
-// ── TEXTAREA INPUT ────────────────────────────────────────────────────────────
-//
-// Debounced 300ms: waits for a 300ms pause after the last keystroke before
-// sending. Prevents flooding Firebase with every individual character.
-
-textarea.addEventListener("input", () => {
-  clearTimeout(debounce);
-  debounce = setTimeout(() => {
-    const text = textarea.value;
-    if (mode === "firebase") {
-      fbWrite(text);
-    } else if (mode === "local" && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(text);
+  // Dismiss on the NEXT outside click
+  // Using a named handler so we can remove it cleanly
+  function dismiss(e) {
+    if (!pop.contains(e.target) && e.target !== btnEl) {
+      pop.remove();
+      document.removeEventListener("click", dismiss, true);
     }
-  }, 150);
+  }
+  // Use capture phase + a microtask gap to skip the current click entirely
+  setTimeout(() => document.addEventListener("click", dismiss, true), 0);
+}
+
+// Wire ? buttons via addEventListener so we can call stopPropagation,
+// preventing the opening click from bubbling into the dismiss handler
+document.getElementById("notes-help-btn").addEventListener("click", function(e) {
+  e.stopPropagation();
+  togglePopover(this, "notes-pop");
+});
+document.getElementById("conn-help-btn").addEventListener("click", function(e) {
+  e.stopPropagation();
+  togglePopover(this, "conn-pop");
 });
 
-
-// ── RESTORE SAVED STATE ───────────────────────────────────────────────────────
-
+// ── INIT ──────────────────────────────────────────────────────────────────────
 const savedMode   = localStorage.getItem("overlay-mode")    || "firebase";
 const savedFbUrl  = localStorage.getItem("overlay-fb-url")  || "";
 const savedWsAddr = localStorage.getItem("overlay-ws-addr") || "";
@@ -313,10 +1079,10 @@ document.getElementById("fb-url").value  = savedFbUrl;
 document.getElementById("ws-addr").value = savedWsAddr;
 
 setMode(savedMode);
+updateAll();
 
-// Auto-load content if a saved Firebase URL exists
-if (savedMode === "firebase" && savedFbUrl) fbLoad();
+if      (savedMode==="firebase" && savedFbUrl)   fbConnect();
+else if (savedMode==="local"    && savedWsAddr)   connectWS();
 </script>
-
 </body>
 </html>

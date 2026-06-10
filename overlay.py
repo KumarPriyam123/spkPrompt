@@ -756,10 +756,14 @@ class OverlayApp:
     def _autoscroll_step(self):
         if not self._autoscroll_active:
             return
-        self.text.yview_scroll(1, "units")
         self._autoscroll_tick += 1
 
-        if self._autoscroll_tick % 8 == 0:
+        # scroll 1 line every 3 ticks → ~1 line per 240 ms (comfortable teleprompter pace)
+        if self._autoscroll_tick % 3 == 0:
+            self.text.yview_scroll(1, "units")
+
+        # advance word highlight every 5 ticks → ~1 word per 400 ms ≈ 150 wpm
+        if self._autoscroll_tick % 5 == 0:
             words = self._autoscroll_words
             idx   = self._autoscroll_word_idx
             if words and idx < len(words):
@@ -772,7 +776,7 @@ class OverlayApp:
                 self._toggle_autoscroll()
                 return
 
-        self.root.after(50, self._autoscroll_step)
+        self.root.after(80, self._autoscroll_step)
 
     # ── SETTINGS POPUP ───────────────────────────────────────────────────────
 
@@ -1024,26 +1028,67 @@ class OverlayApp:
             self.root.destroy()
 
 
+# ── .ENV LOADER ──────────────────────────────────────────────────────────────
+
+def _load_dotenv():
+    """Load KEY=VALUE pairs from a .env file next to overlay.py (no external deps)."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip(); v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:   # CLI env always wins
+                os.environ[k] = v
+
+
+def _print_local_ip(port):
+    import socket
+    try:    ip = socket.gethostbyname(socket.gethostname())
+    except: ip = "127.0.0.1"
+    print(f"Local WebSocket server started.\nOpen the web UI and enter: {ip}:{port}")
+
+
 # ── ENTRY POINT ──────────────────────────────────────────────────────────────
 
 def main():
+    _load_dotenv()
     root = tk.Tk()
     app  = OverlayApp(root)
 
     args = sys.argv[1:]
+
     if "--firebase" in args:
-        app.start_firebase_sync(args[args.index("--firebase") + 1])
+        idx = args.index("--firebase")
+        # URL arg is optional — falls back to FIREBASE_URL from .env
+        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
+            url = args[idx + 1]
+        else:
+            url = os.environ.get("FIREBASE_URL", "")
+        if url:
+            app.start_firebase_sync(url)
+        else:
+            print("No Firebase URL provided. Pass it as: --firebase <URL>  "
+                  "or set FIREBASE_URL=<URL> in a .env file next to overlay.py")
     elif "--local" in args:
-        port = 8765
-        if "--port" in args:
-            port = int(args[args.index("--port") + 1])
+        port = int(args[args.index("--port") + 1]) if "--port" in args else 8765
         app.start_local_ws_server(port)
-        import socket
-        try:    ip = socket.gethostbyname(socket.gethostname())
-        except: ip = "127.0.0.1"
-        print(f"Local WebSocket server started.\nOpen the web UI and enter: {ip}:{port}")
+        _print_local_ip(port)
     elif args and not args[0].startswith("--"):
         app.load_file(args[0])
+    else:
+        # No CLI mode flag — auto-start from .env if values are present
+        if os.environ.get("FIREBASE_URL"):
+            print(f"Auto-connecting to Firebase from .env …")
+            app.start_firebase_sync(os.environ["FIREBASE_URL"])
+        elif os.environ.get("LOCAL_WS", "").lower() in ("1", "true", "yes"):
+            port = int(os.environ.get("LOCAL_WS_PORT", "8765"))
+            app.start_local_ws_server(port)
+            _print_local_ip(port)
 
     root.mainloop()
 
