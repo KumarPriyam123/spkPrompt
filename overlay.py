@@ -1,49 +1,64 @@
 import tkinter as tk
 from tkinter import filedialog
-import ctypes
-import re
-import sys
-import os
-import threading
-import json
-import time
-import asyncio
+import ctypes, re, sys, os, threading, json, time, asyncio
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
+# ── ALEXANDRIA COLOR TOKENS ──────────────────────────────────────────────────
 C = {
-    "bg":           "#2b2d42",
-    "bar":          "#1a1b2e",
-    "content":      "#252737",
-    "h1":           "#e0c3fc",
-    "h2":           "#72efdd",
-    "body":         "#d9d9e3",
-    "accent":       "#f77f00",
-    "dim":          "#6c6f93",
-    "border":       "#3d3f5c",
+    "bg":       "#141314",   # outer window bg
+    "bar":      "#1b1c1d",   # top bar, sidebar
+    "card_dim": "#191a1b",   # prev/next card background
+    "card_act": "#1e2022",   # active card background
+    "prompt":   "#252829",   # speaker prompt box bg
+    "primary":  "#b1c5ff",   # accent bar, active icons, highlights
+    "on_s":     "#e3e2e3",   # primary text
+    "on_sv":    "#c3c6d5",   # secondary text
+    "muted":    "#565966",   # prev/next preview text
+    "outline":  "#434653",   # separators
+    "tertiary": "#dcc661",   # archival gold
+    "red":      "#ff5f56",
+    "yellow":   "#ffbd2e",
+    "green":    "#27c93f",
 }
 
-MIN_W, MIN_H = 300, 200
+MIN_W, MIN_H = 480, 360
+SERIF = "Noto Serif"
+SANS  = "Inter"
+LABEL = "Public Sans"
 
 
 class OverlayApp:
+
     def __init__(self, root):
-        self.root = root
-        self.slides = ["# No file loaded\n\nClick  ⋮ → Load File  to open a .txt file."]
-        self.current = 0
-        self.font_size = 11
+        self.root      = root
+        self.slides    = ["# Welcome\n\nOpen a file via ⚙  or connect to sync."]
+        self.current   = 0
+        self.font_size = 12
+
         self._drag_x = self._drag_y = 0
-        self._resize_data = None
-        self._controls_win = None
-        self._sync_mode = None
+        self._resize_data   = None
+        self._sync_mode     = None
+        self._sync_version  = 0          # increments to cancel old sync threads
+        self._settings_win  = None
+        self._logs_visible  = False
+        self._logs_frame    = None
+        self._elapsed       = 0
+        self._live_state    = True
+
+        self._autoscroll_active   = False
+        self._autoscroll_words    = []
+        self._autoscroll_word_idx = 0
+        self._autoscroll_tick     = 0
+
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
 
         self._setup_window()
         self._build_ui()
-        self._configure_tags()
         self._cloak(self.root)
         self._setup_resize_handles()
         self.render_slide()
+        self._tick_timer()
         self.root.focus_force()
 
     # ── WINDOW ───────────────────────────────────────────────────────────────
@@ -51,241 +66,492 @@ class OverlayApp:
     def _setup_window(self):
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.92)
-        self.root.geometry("560x380+200+150")
+        self.root.attributes("-alpha", 0.93)
+        self.root.geometry("700x500+150+100")
         self.root.configure(bg=C["bg"])
         self.root.minsize(MIN_W, MIN_H)
 
     def _cloak(self, window):
-        # window.update() flushes tkinter's work queue so the Win32 HWND exists.
-        # winfo_id() returns the inner child HWND; GetParent() gives the real
-        # top-level wrapper that SetWindowDisplayAffinity requires.
         window.update()
         inner = window.winfo_id()
-        hwnd = ctypes.windll.user32.GetParent(inner) or inner
+        hwnd  = ctypes.windll.user32.GetParent(inner) or inner
         self._user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
 
-    # ── UI CONSTRUCTION ──────────────────────────────────────────────────────
+    def _minimize(self):
+        """Minimize via the overrideredirect toggle trick."""
+        self.root.overrideredirect(False)
+        self.root.iconify()
+        self.root.bind("<Map>", self._on_restore)
+
+    def _on_restore(self, event):
+        self.root.overrideredirect(True)
+        self.root.unbind("<Map>")
+        self._cloak(self.root)
+
+    # ── UI BUILD ─────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._build_topbar()
-        self._build_content()
-        self._build_bottombar()
+        self._build_body()
         self._bind_keys()
 
+    # ── TOP BAR ──────────────────────────────────────────────────────────────
+
     def _build_topbar(self):
-        bar = tk.Frame(self.root, bg=C["bar"], height=34)
+        bar = tk.Frame(self.root, bg=C["bar"], height=44)
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
+        bar.bind("<ButtonPress-1>", self._start_drag)
+        bar.bind("<B1-Motion>",     self._do_drag)
 
-        _btn = dict(bg=C["bar"], bd=0, font=("Segoe UI", 11), cursor="hand2",
-                    activebackground=C["bar"], relief="flat", padx=6)
+        left = tk.Frame(bar, bg=C["bar"])
+        left.pack(side="left", padx=(14, 0))
+        left.bind("<ButtonPress-1>", self._start_drag)
+        left.bind("<B1-Motion>",     self._do_drag)
 
-        self.prev_btn = tk.Button(bar, text="◀", fg=C["dim"],
-                                  activeforeground=C["accent"],
-                                  command=lambda: self.navigate(-1), **_btn)
-        self.prev_btn.pack(side="left", padx=(8, 0), pady=4)
+        for color, symbol, cmd in [
+            (C["red"],    "✕", self.root.destroy),
+            (C["yellow"], "−", self._minimize),
+            (C["green"],  "●", lambda: None),
+        ]:
+            dot = tk.Frame(left, bg=color, width=16, height=16,
+                           cursor="hand2")
+            dot.pack(side="left", padx=3)
+            dot.pack_propagate(False)
+            lbl = tk.Label(dot, text=symbol, bg=color, fg=C["bar"],
+                           font=(SANS, 8, "bold"), cursor="hand2")
+            lbl.place(relx=0.5, rely=0.5, anchor="center")
+            for w in (dot, lbl):
+                w.bind("<Button-1>", lambda e, c=cmd: c())
 
-        self.counter = tk.Label(bar, text="1/1", bg=C["bar"],
-                                fg=C["dim"], font=("Segoe UI", 9))
-        self.counter.pack(side="left", padx=6)
+        tk.Label(left, text="  📖", bg=C["bar"], fg=C["primary"],
+                 font=(SANS, 13)).pack(side="left", padx=(8, 4))
 
-        self.next_btn = tk.Button(bar, text="▶", fg=C["dim"],
-                                  activeforeground=C["accent"],
-                                  command=lambda: self.navigate(1), **_btn)
-        self.next_btn.pack(side="left")
+        title = tk.Label(left, text="PRESENTER PRO — ALEXANDRIA",
+                         bg=C["bar"], fg=C["on_sv"], font=(LABEL, 8, "bold"))
+        title.pack(side="left")
+        title.bind("<ButtonPress-1>", self._start_drag)
+        title.bind("<B1-Motion>",     self._do_drag)
 
-        # Sync indicator — shows "⬤ live" when Firebase/WS connected
-        self.sync_label = tk.Label(bar, text="", bg=C["bar"],
-                                   fg=C["dim"], font=("Segoe UI", 8))
-        self.sync_label.pack(side="left", padx=(10, 0))
+        # Right cluster
+        right = tk.Frame(bar, bg=C["bar"])
+        right.pack(side="right", padx=(0, 14))
 
-        self.menu_btn = tk.Button(bar, text="⋮", fg=C["dim"],
-                                  activeforeground=C["accent"],
-                                  command=self.toggle_controls, **_btn)
-        self.menu_btn.pack(side="right", padx=(0, 8))
+        self._gear_btn = tk.Button(
+            right, text="⚙", bg=C["bar"], fg=C["on_sv"],
+            bd=0, font=(SANS, 13), cursor="hand2",
+            activebackground=C["bar"], activeforeground=C["primary"],
+            relief="flat", command=self._open_settings)
+        self._gear_btn.pack(side="right", padx=(6, 0))
 
-        for widget in (bar, self.counter):
-            widget.bind("<ButtonPress-1>", self._start_drag)
-            widget.bind("<B1-Motion>", self._do_drag)
+        tk.Frame(right, bg=C["outline"], width=1).pack(
+            side="right", fill="y", pady=10, padx=8)
 
-    def _build_content(self):
-        frame = tk.Frame(self.root, bg=C["content"])
-        frame.pack(fill="both", expand=True)
+        self.timer_label = tk.Label(right, text="00:00:00",
+                                    bg=C["bar"], fg=C["on_sv"],
+                                    font=(LABEL, 9))
+        self.timer_label.pack(side="right", padx=(0, 4))
+
+        tk.Label(right, text="🕐", bg=C["bar"], fg=C["on_sv"],
+                 font=(SANS, 10)).pack(side="right")
+
+        self._live_frame = tk.Frame(right, bg=C["bar"])
+        self._live_dot   = tk.Label(self._live_frame, text="●",
+                                    fg=C["primary"], bg=C["bar"],
+                                    font=(SANS, 7))
+        self._live_dot.pack(side="left")
+        tk.Label(self._live_frame, text="LIVE SYNCING",
+                 bg=C["bar"], fg=C["primary"],
+                 font=(LABEL, 7, "bold")).pack(side="left", padx=(3, 0))
+
+    # ── BODY ─────────────────────────────────────────────────────────────────
+
+    def _build_body(self):
+        body = tk.Frame(self.root, bg=C["bg"])
+        body.pack(fill="both", expand=True)
+        self._build_sidebar(body)
+        self._build_main_column(body)
+
+    # ── SIDEBAR ──────────────────────────────────────────────────────────────
+
+    def _build_sidebar(self, parent):
+        sb = tk.Frame(parent, bg=C["bar"], width=72)
+        sb.pack(side="left", fill="y")
+        sb.pack_propagate(False)
+
+        self._active_tab  = "notes"
+        self._tab_widgets = {}
+
+        def make_tab(icon, label, name, cmd):
+            a    = (name == "notes")
+            ibg  = C["primary"] if a else C["bar"]
+            ifg  = C["bar"]     if a else C["on_sv"]
+            nfg  = C["primary"] if a else C["on_sv"]
+            wrap = tk.Frame(sb, bg=C["bar"], cursor="hand2")
+            wrap.pack(pady=(14, 0))
+            icon_f = tk.Frame(wrap, bg=ibg, width=38, height=38)
+            icon_f.pack(); icon_f.pack_propagate(False)
+            icon_l = tk.Label(icon_f, text=icon, bg=ibg, fg=ifg, font=(SANS, 15))
+            icon_l.pack(expand=True)
+            name_l = tk.Label(wrap, text=label, bg=C["bar"], fg=nfg,
+                              font=(LABEL, 7, "bold"))
+            name_l.pack(pady=(2, 0))
+            self._tab_widgets[name] = (icon_f, icon_l, name_l)
+
+            def click(e, n=name, c=cmd):
+                self._set_active_tab(n); c()
+
+            for w in (wrap, icon_f, icon_l, name_l):
+                w.bind("<Button-1>", click)
+
+        make_tab("✏", "NOTES", "notes", self._show_notes)
+        make_tab("≡", "LOGS",  "logs",  self._toggle_logs_panel)
+
+        hf = tk.Frame(sb, bg=C["bar"], cursor="hand2")
+        hf.pack(side="bottom", pady=12)
+        tk.Label(hf, text="?", bg=C["bar"], fg=C["on_sv"],
+                 font=(LABEL, 12, "bold")).pack()
+
+    def _set_active_tab(self, name):
+        self._active_tab = name
+        for n, (icon_f, icon_l, name_l) in self._tab_widgets.items():
+            a = (n == name)
+            ibg = C["primary"] if a else C["bar"]
+            icon_f.config(bg=ibg)
+            icon_l.config(bg=ibg, fg=C["bar"] if a else C["on_sv"])
+            name_l.config(fg=C["primary"] if a else C["on_sv"])
+
+    def _show_notes(self):
+        if self._logs_visible:
+            self._hide_logs()
+
+    # ── MAIN COLUMN ──────────────────────────────────────────────────────────
+
+    def _build_main_column(self, parent):
+        col = tk.Frame(parent, bg=C["bg"])
+        col.pack(side="left", fill="both", expand=True)
+        self._main_col = col
+        self._build_statusbar(col)
+        self._build_viewport(col)
+        self._build_progress(col)
+
+    # ── STATUS BAR ───────────────────────────────────────────────────────────
+
+    def _build_statusbar(self, parent):
+        bar = tk.Frame(parent, bg=C["bar"], height=40)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        self._breadcrumb = tk.Label(bar, text="",
+                                    bg=C["bar"], fg=C["outline"],
+                                    font=(LABEL, 8, "bold"))
+        self._breadcrumb.pack(side="left", padx=(16, 0))
+
+        right = tk.Frame(bar, bg=C["bar"])
+        right.pack(side="right", padx=8)
+
+        _b = dict(bg=C["card_act"], fg=C["on_s"], bd=0,
+                  font=(LABEL, 8, "bold"), width=3, cursor="hand2",
+                  relief="flat", activebackground=C["primary"],
+                  activeforeground=C["bg"], padx=5, pady=4)
+
+        tk.Button(right, text="A−",
+                  command=lambda: self._change_font(-1), **_b).pack(
+                  side="left", padx=(0, 2))
+        tk.Button(right, text="A+",
+                  command=lambda: self._change_font(1),  **_b).pack(
+                  side="left", padx=(0, 10))
+
+        self._auto_btn = tk.Button(
+            right, text="▶  AUTO", command=self._toggle_autoscroll,
+            bg=C["on_s"], fg=C["bg"], bd=0, font=(LABEL, 8, "bold"),
+            cursor="hand2", relief="flat",
+            activebackground=C["primary"], activeforeground=C["bg"],
+            padx=10, pady=4)
+        self._auto_btn.pack(side="left")
+
+    # ── VIEWPORT — three distinct card boxes ─────────────────────────────────
+    #
+    # Layout uses grid so we can show/hide prev & next cards cleanly.
+    # row 0 = prev card   (hidden on first slide)
+    # row 1 = active card (always visible, expands to fill space)
+    # row 2 = next card   (hidden on last slide)
+
+    def _build_viewport(self, parent):
+        vp = tk.Frame(parent, bg=C["bg"])
+        vp.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+        vp.grid_rowconfigure(1, weight=1)
+        vp.grid_columnconfigure(0, weight=1)
+        self._vp = vp
+
+        # ── PREV CARD ──
+        pc = tk.Frame(vp, bg=C["card_dim"], cursor="hand2")
+        pc.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self._prev_card = pc
+
+        self._prev_nav  = tk.Label(pc, text="", bg=C["card_dim"],
+                                   fg=C["outline"], font=(LABEL, 7, "bold"),
+                                   anchor="w", cursor="hand2")
+        self._prev_nav.pack(fill="x", padx=14, pady=(8, 2))
+
+        self._prev_text = tk.Label(pc, text="", bg=C["card_dim"],
+                                   fg=C["muted"],
+                                   font=(SERIF, self.font_size - 2, "italic"),
+                                   anchor="w", justify="left",
+                                   wraplength=1,   # set dynamically
+                                   cursor="hand2")
+        self._prev_text.pack(fill="x", padx=14, pady=(0, 8))
+
+        for w in (pc, self._prev_nav, self._prev_text):
+            w.bind("<Button-1>", lambda e: self.navigate(-1))
+            w.bind("<Enter>",    lambda e: self._prev_card.config(bg=C["card_act"]))
+            w.bind("<Leave>",    lambda e: self._prev_card.config(bg=C["card_dim"]))
+
+        # ── ACTIVE CARD ──
+        ac_outer = tk.Frame(vp, bg=C["card_act"])
+        ac_outer.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        ac_outer.grid_rowconfigure(0, weight=1)
+        ac_outer.grid_columnconfigure(1, weight=1)
+        self._active_card = ac_outer
+
+        # left blue accent bar
+        accent = tk.Frame(ac_outer, bg=C["primary"], width=3)
+        accent.grid(row=0, column=0, sticky="ns")
+
+        # inner content frame
+        inner = tk.Frame(ac_outer, bg=C["card_act"])
+        inner.grid(row=0, column=1, sticky="nsew")
+        inner.grid_rowconfigure(1, weight=1)
+        inner.grid_columnconfigure(0, weight=1)
+
+        self._manuscript_lbl = tk.Label(
+            inner, text="", bg=C["card_act"],
+            fg=C["primary"], font=(LABEL, 8, "bold"), anchor="w")
+        self._manuscript_lbl.grid(row=0, column=0, sticky="ew",
+                                  padx=(14, 10), pady=(10, 4))
 
         self.text = tk.Text(
-            frame,
-            bg=C["content"], fg=C["body"],
-            relief="flat", bd=0,
-            state="disabled",
-            wrap="word",
-            cursor="arrow",
-            font=("Segoe UI", 11),
-            padx=18, pady=14,
-            spacing2=3,
-            selectbackground=C["border"],
-            insertwidth=0,
-        )
-        self.text.pack(fill="both", expand=True)
+            inner,
+            bg=C["card_act"], fg=C["on_s"],
+            relief="flat", bd=0, state="disabled",
+            wrap="word", cursor="arrow",
+            font=(SANS, self.font_size),
+            padx=14, pady=4,
+            spacing2=4, spacing3=4,
+            selectbackground=C["outline"],
+            insertwidth=0)
+        self.text.grid(row=1, column=0, sticky="nsew")
+        self._configure_tags()
 
-    def _build_bottombar(self):
-        bottom = tk.Frame(self.root, bg=C["bar"], height=22)
-        bottom.pack(fill="x", side="bottom")
-        bottom.pack_propagate(False)
+        # ── NEXT CARD ──
+        nc = tk.Frame(vp, bg=C["card_dim"], cursor="hand2")
+        nc.grid(row=2, column=0, sticky="ew")
+        self._next_card = nc
 
-        self.dots_frame = tk.Frame(bottom, bg=C["bar"])
-        self.dots_frame.pack(side="left", padx=10, pady=4)
+        # dashed separator line
+        sep = tk.Frame(nc, bg=C["outline"], height=1)
+        sep.pack(fill="x")
 
-    def _bind_keys(self):
-        self.root.bind("<Left>",   lambda e: self.navigate(-1))
-        self.root.bind("<Right>",  lambda e: self.navigate(1))
-        self.root.bind("<Escape>", self._handle_escape)
+        self._next_nav  = tk.Label(nc, text="", bg=C["card_dim"],
+                                   fg=C["outline"], font=(LABEL, 7, "bold"),
+                                   anchor="w", cursor="hand2")
+        self._next_nav.pack(fill="x", padx=14, pady=(8, 2))
 
-    # ── RESIZE HANDLES ───────────────────────────────────────────────────────
-    #
-    # 8 invisible Frame widgets placed with relative coordinates (relx/rely)
-    # so they automatically track window size changes.
-    # Edges first (lower z-order), corners on top.
+        self._next_text = tk.Label(nc, text="", bg=C["card_dim"],
+                                   fg=C["muted"],
+                                   font=(SANS, self.font_size - 2),
+                                   anchor="w", justify="left",
+                                   wraplength=1,
+                                   cursor="hand2")
+        self._next_text.pack(fill="x", padx=14, pady=(0, 8))
 
-    def _setup_resize_handles(self):
-        CORNER = 14
-        EDGE   = 6
+        for w in (nc, self._next_nav, self._next_text, sep):
+            w.bind("<Button-1>", lambda e: self.navigate(1))
+            w.bind("<Enter>",    lambda e: self._next_card.config(bg=C["card_act"]))
+            w.bind("<Leave>",    lambda e: self._next_card.config(bg=C["card_dim"]))
 
-        specs = [
-            ("size_ns",    dict(relx=0.5, rely=0,   anchor="n",  relwidth=1.0, height=EDGE,   width=0),  "n"),
-            ("size_ns",    dict(relx=0.5, rely=1.0, anchor="s",  relwidth=1.0, height=EDGE,   width=0),  "s"),
-            ("size_we",    dict(relx=0,   rely=0.5, anchor="w",  width=EDGE,   relheight=1.0, height=0), "w"),
-            ("size_we",    dict(relx=1.0, rely=0.5, anchor="e",  width=EDGE,   relheight=1.0, height=0), "e"),
-            ("size_nw_se", dict(relx=0,   rely=0,   anchor="nw", width=CORNER, height=CORNER),           "nw"),
-            ("size_ne_sw", dict(relx=1.0, rely=0,   anchor="ne", width=CORNER, height=CORNER),           "ne"),
-            ("size_ne_sw", dict(relx=0,   rely=1.0, anchor="sw", width=CORNER, height=CORNER),           "sw"),
-            ("size_nw_se", dict(relx=1.0, rely=1.0, anchor="se", width=CORNER, height=CORNER),           "se"),
-        ]
+        # keep wraplength in sync with window width
+        vp.bind("<Configure>", self._on_vp_resize)
 
-        for cursor, place_kw, direction in specs:
-            f = tk.Frame(self.root, cursor=cursor, bg=C["bg"])
-            f.place(**place_kw)
-            f.bind("<ButtonPress-1>", lambda e, d=direction: self._start_resize(e, d))
-            f.bind("<B1-Motion>",     lambda e, d=direction: self._do_resize(e, d))
+    def _on_vp_resize(self, event):
+        wl = max(100, event.width - 56)
+        self._prev_text.config(wraplength=wl)
+        self._next_text.config(wraplength=wl)
 
-    def _start_resize(self, event, direction):
-        self._resize_data = {
-            "start_x": event.x_root,
-            "start_y": event.y_root,
-            "orig_x":  self.root.winfo_x(),
-            "orig_y":  self.root.winfo_y(),
-            "orig_w":  self.root.winfo_width(),
-            "orig_h":  self.root.winfo_height(),
-        }
+    # ── PROGRESS BAR ─────────────────────────────────────────────────────────
 
-    def _do_resize(self, event, direction):
-        if not self._resize_data:
-            return
-        d = self._resize_data
-        dx = event.x_root - d["start_x"]
-        dy = event.y_root - d["start_y"]
-        x, y = d["orig_x"], d["orig_y"]
-        w, h = d["orig_w"], d["orig_h"]
+    def _build_progress(self, parent):
+        prog = tk.Frame(parent, bg=C["bar"], height=2)
+        prog.pack(fill="x")
+        prog.pack_propagate(False)
+        self._prog_fill = tk.Frame(prog, bg=C["primary"])
+        self._prog_fill.place(x=0, y=0, relheight=1, width=0)
 
-        if direction == "se":
-            w = max(MIN_W, w + dx);  h = max(MIN_H, h + dy)
-        elif direction == "sw":
-            nw = max(MIN_W, w - dx); x += w - nw; w = nw
-            h  = max(MIN_H, h + dy)
-        elif direction == "ne":
-            w  = max(MIN_W, w + dx)
-            nh = max(MIN_H, h - dy); y += h - nh; h = nh
-        elif direction == "nw":
-            nw = max(MIN_W, w - dx); x += w - nw; w = nw
-            nh = max(MIN_H, h - dy); y += h - nh; h = nh
-        elif direction == "e":
-            w = max(MIN_W, w + dx)
-        elif direction == "w":
-            nw = max(MIN_W, w - dx); x += w - nw; w = nw
-        elif direction == "s":
-            h = max(MIN_H, h + dy)
-        elif direction == "n":
-            nh = max(MIN_H, h - dy); y += h - nh; h = nh
-
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
+    def _update_progress(self):
+        total = len(self.slides)
+        ratio = 1.0 if total <= 1 else self.current / (total - 1)
+        self.root.update_idletasks()
+        w = self._prog_fill.master.winfo_width()
+        self._prog_fill.place(x=0, y=0, relheight=1, width=max(1, int(w * ratio)))
 
     # ── TEXT TAGS ────────────────────────────────────────────────────────────
 
     def _configure_tags(self):
         fs = self.font_size
-        self.text.tag_configure("h1",     font=("Segoe UI", fs + 6, "bold"),
-                                           foreground=C["h1"], spacing1=10, spacing3=5)
-        self.text.tag_configure("h2",     font=("Segoe UI", fs + 2, "bold"),
-                                           foreground=C["h2"], spacing1=6, spacing3=3)
-        self.text.tag_configure("body",   font=("Segoe UI", fs),
-                                           foreground=C["body"], spacing1=1)
-        self.text.tag_configure("bold",   font=("Segoe UI", fs, "bold"),
-                                           foreground=C["body"])
-        self.text.tag_configure("bullet", font=("Segoe UI", fs),
-                                           foreground=C["body"],
-                                           lmargin1=26, lmargin2=26, spacing1=2)
-        self.text.tag_configure("dim",    font=("Segoe UI", fs - 1, "italic"),
-                                           foreground=C["dim"])
-
-    def _insert_line(self, line, base_tag):
-        parts = re.split(r'\*\*', line)
-        for i, part in enumerate(parts):
-            tag = "bold" if i % 2 == 1 else base_tag
-            if part:
-                self.text.insert("end", part, tag)
-        self.text.insert("end", "\n")
+        t  = self.text
+        t.tag_configure("h1",
+            font=(SERIF, fs + 10, "bold"), foreground=C["on_s"],
+            spacing1=6, spacing3=4)
+        t.tag_configure("h2",
+            font=(SERIF, fs + 4,  "bold"), foreground=C["on_s"],
+            spacing1=4, spacing3=3)
+        t.tag_configure("body",
+            font=(SANS, fs), foreground=C["on_s"], spacing1=2)
+        t.tag_configure("bold",
+            font=(SANS, fs, "bold"), foreground=C["on_s"])
+        t.tag_configure("bullet",
+            font=(SANS, fs), foreground=C["on_s"],
+            lmargin1=24, lmargin2=24, spacing1=2)
+        t.tag_configure("prompt_header",
+            font=(LABEL, fs - 2, "bold"), foreground=C["primary"],
+            spacing1=14, spacing3=4)
+        t.tag_configure("prompt_body",
+            font=(SERIF, fs, "italic"), foreground=C["on_sv"],
+            lmargin1=14, lmargin2=14, rmargin=14,
+            background=C["prompt"], spacing1=4, spacing3=8)
+        t.tag_configure("keyword",
+            font=(SANS, fs), foreground=C["primary"],
+            background="#1e2a40", underline=True)
+        t.tag_configure("autoscroll_hl",
+            background=C["primary"], foreground=C["bg"])
 
     # ── SLIDE RENDERING ──────────────────────────────────────────────────────
 
+    def _extract_title(self, slide):
+        for line in slide.split('\n'):
+            s = line.strip()
+            if s.startswith('# '):  return s[2:]
+            if s.startswith('## '): return s[3:]
+        return None
+
+    def _preview_text(self, slide, max_lines=2):
+        """Return plain-text preview (strips markdown, max N lines)."""
+        out = []
+        for line in slide.split('\n'):
+            s = line.strip()
+            if not s:
+                continue
+            for prefix in ('## ', '# ', '- ', '* ', '> '):
+                if s.startswith(prefix):
+                    s = s[len(prefix):]
+                    break
+            # Strip **bold**
+            s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+            # Strip ==highlight==
+            s = re.sub(r'==(.+?)==', r'\1', s)
+            if s:
+                out.append(s)
+            if len(out) >= max_lines:
+                break
+        return '  '.join(out)
+
+    def _insert_rich(self, line, base_tag):
+        """Insert one line with **bold** and ==keyword== parsing."""
+        parts = re.split(r'==(.+?)==', line)
+        for ki, kp in enumerate(parts):
+            if ki % 2 == 1:
+                self.text.insert("end", kp, "keyword")
+            else:
+                for bi, bp in enumerate(re.split(r'\*\*', kp)):
+                    if bp:
+                        self.text.insert("end", bp,
+                                         "bold" if bi % 2 == 1 else base_tag)
+        self.text.insert("end", "\n")
+
+    def _render_active_content(self, slide):
+        in_prompt    = False
+        blank_pend   = False
+        for raw in slide.split('\n'):
+            line = raw.strip()
+            if not line:
+                blank_pend = True
+                continue
+            if blank_pend:
+                self.text.insert("end", "\n")
+                blank_pend = False
+            if line.startswith('> '):
+                if not in_prompt:
+                    self.text.insert("end", "❝  SPEAKER PROMPT\n", "prompt_header")
+                    in_prompt = True
+                self._insert_rich(line[2:], "prompt_body")
+            else:
+                in_prompt = False
+                if   line.startswith('# '):         self._insert_rich(line[2:],  "h1")
+                elif line.startswith('## '):         self._insert_rich(line[3:],  "h2")
+                elif line.startswith(('- ', '* ')): self._insert_rich('  •  ' + line[2:], "bullet")
+                else:                                self._insert_rich(line,      "body")
+
     def render_slide(self):
+        # Stop autoscroll
+        if self._autoscroll_active:
+            self._autoscroll_active = False
+            self._auto_btn.config(text="▶  AUTO", bg=C["on_s"], fg=C["bg"])
+            self.text.config(state="normal")
+            self.text.tag_remove("autoscroll_hl", "1.0", "end")
+            self.text.config(state="disabled")
+
+        # ── PREV CARD ──
+        if self.current > 0:
+            prev_title   = self._extract_title(self.slides[self.current - 1]) or ""
+            prev_preview = self._preview_text(self.slides[self.current - 1])
+            self._prev_nav.config(
+                text=f"◀  SLIDE {self.current}  ·  {prev_title.upper()}")
+            self._prev_text.config(text=prev_preview)
+            self._prev_card.grid()
+        else:
+            self._prev_card.grid_remove()
+
+        # ── ACTIVE CARD ──
+        self._manuscript_lbl.config(
+            text=f"ACTIVE MANUSCRIPT  ·  SLIDE {self.current + 1}")
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
-
-        slide = self.slides[self.current]
-        blank_pending = False
-
-        for raw_line in slide.split('\n'):
-            line = raw_line.strip()
-
-            if line == '':
-                blank_pending = True
-                continue
-
-            if blank_pending:
-                self.text.insert("end", "\n")
-                blank_pending = False
-
-            if line.startswith('## '):
-                self._insert_line(line[3:], "h2")
-            elif line.startswith('# '):
-                self._insert_line(line[2:], "h1")
-            elif line.startswith(('- ', '* ')):
-                self._insert_line('  •  ' + line[2:], "bullet")
-            else:
-                self._insert_line(line, "body")
-
+        self._render_active_content(self.slides[self.current])
         self.text.config(state="disabled")
-        self._update_nav()
 
-    def _update_nav(self):
-        total = len(self.slides)
-        self.counter.config(text=f"{self.current + 1} / {total}")
-        self.prev_btn.config(fg=C["accent"] if self.current > 0         else C["dim"])
-        self.next_btn.config(fg=C["accent"] if self.current < total - 1 else C["dim"])
-        self._update_dots()
+        # ── NEXT CARD ──
+        if self.current < len(self.slides) - 1:
+            next_title   = self._extract_title(self.slides[self.current + 1]) or ""
+            next_preview = self._preview_text(self.slides[self.current + 1])
+            self._next_nav.config(
+                text=f"▶  SLIDE {self.current + 2}  ·  {next_title.upper()}")
+            self._next_text.config(text=next_preview)
+            self._next_card.grid()
+        else:
+            self._next_card.grid_remove()
 
-    def _update_dots(self):
-        for w in self.dots_frame.winfo_children():
-            w.destroy()
-        for i in range(len(self.slides)):
-            color = C["accent"] if i == self.current else C["border"]
-            tk.Label(self.dots_frame, text="●", fg=color,
-                     bg=C["bar"], font=("Segoe UI", 7)).pack(side="left", padx=1)
+        self._update_statusbar()
+        self._update_progress()
+        self._build_autoscroll_words()
+
+    def _update_statusbar(self):
+        title = self._extract_title(self.slides[self.current]) or ""
+        text  = f"SLIDE {self.current + 1} / {len(self.slides)}"
+        if title:
+            text += f"  ›  {title.upper()}"
+        self._breadcrumb.config(text=text)
+
+    # ── NAVIGATION ───────────────────────────────────────────────────────────
 
     def navigate(self, delta):
         new = self.current + delta
         if 0 <= new < len(self.slides):
             self.current = new
+            self.render_slide()
+
+    def navigate_to(self, index):
+        if 0 <= index < len(self.slides):
+            self.current = index
             self.render_slide()
 
     # ── FILE LOADING ─────────────────────────────────────────────────────────
@@ -294,64 +560,107 @@ class OverlayApp:
         if path is None:
             path = filedialog.askopenfilename(
                 title="Open notes file",
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-            )
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not path or not os.path.exists(path):
             return
         with open(path, encoding="utf-8") as f:
             content = f.read().replace('\r\n', '\n').replace('\r', '\n')
-        parsed = [s.strip() for s in re.split(r'\n\s*---\s*\n', content) if s.strip()]
-        self.slides = parsed if parsed else ["# Empty file\n\nNo slides found."]
+        parsed       = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
+                        if s.strip()]
+        self.slides  = parsed if parsed else ["# Empty file\n\nNo slides found."]
         self.current = 0
         self.render_slide()
         self.root.focus_force()
 
-    # ── REMOTE SYNC — SHARED ─────────────────────────────────────────────────
+    # ── LOGS PANEL ───────────────────────────────────────────────────────────
+
+    def _toggle_logs_panel(self):
+        if self._logs_visible: self._hide_logs()
+        else:                  self._show_logs()
+
+    def _hide_logs(self):
+        self._logs_visible = False
+        if self._logs_frame and self._logs_frame.winfo_exists():
+            self._logs_frame.place_forget()
+        self._set_active_tab("notes")
+
+    def _show_logs(self):
+        self._logs_visible = True
+        if self._logs_frame and self._logs_frame.winfo_exists():
+            self._logs_frame.destroy()
+
+        frame = tk.Frame(self._main_col, bg=C["bar"])
+        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._logs_frame = frame
+
+        tk.Label(frame, text="SLIDE SWITCHER",
+                 bg=C["bar"], fg=C["outline"],
+                 font=(LABEL, 8, "bold")).pack(pady=(14, 4))
+        tk.Frame(frame, bg=C["outline"], height=1).pack(fill="x", padx=12)
+
+        lf = tk.Frame(frame, bg=C["bar"])
+        lf.pack(fill="both", expand=True, padx=10, pady=8)
+
+        sb = tk.Scrollbar(lf)
+        sb.pack(side="right", fill="y")
+
+        lb = tk.Listbox(lf, bg=C["bar"], fg=C["on_s"],
+                        selectbackground=C["primary"],
+                        selectforeground=C["bg"],
+                        font=(SANS, 11), bd=0, relief="flat",
+                        activestyle="none", highlightthickness=0,
+                        yscrollcommand=sb.set)
+        lb.pack(fill="both", expand=True)
+        sb.config(command=lb.yview)
+
+        for i, slide in enumerate(self.slides):
+            t = self._extract_title(slide) or f"Slide {i + 1}"
+            lb.insert(tk.END, f"  {i + 1}.  {t}")
+
+        lb.selection_set(self.current)
+        lb.see(self.current)
+
+        def go(e):
+            sel = lb.curselection()
+            if sel:
+                self.navigate_to(sel[0])
+                self._hide_logs()
+
+        lb.bind("<Double-1>", go)
+        lb.bind("<Return>",   go)
+
+        tk.Button(frame, text="✕  Close", command=self._hide_logs,
+                  bg=C["bar"], fg=C["on_sv"], bd=0, font=(LABEL, 8),
+                  relief="flat", cursor="hand2").pack(pady=(0, 10))
+
+    # ── REMOTE SYNC ──────────────────────────────────────────────────────────
 
     def _apply_remote_content(self, content):
-        """Called on the main tkinter thread via root.after(0, ...).
-        Parses incoming text and re-renders slides without resetting current index
-        unless the slide count changed."""
         content = content.replace('\r\n', '\n').replace('\r', '\n')
-        parsed = [s.strip() for s in re.split(r'\n\s*---\s*\n', content) if s.strip()]
+        parsed  = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
+                   if s.strip()]
         if not parsed:
             return
-        self.slides = parsed
+        self.slides  = parsed
         self.current = min(self.current, len(parsed) - 1)
         self.render_slide()
 
-    # ── REMOTE SYNC — FIREBASE RTDB (SSE) ────────────────────────────────────
-    #
-    # Firebase exposes its Realtime DB as a standard SSE endpoint.
-    # We open a persistent HTTP connection; Firebase pushes a "put" event
-    # every time the value at the path changes. No polling, no SDK needed.
-    #
-    # The stream runs in a daemon thread so it dies with the app automatically.
-    # On any network error it waits 3s then reconnects — handles WiFi drops,
-    # sleep/wake cycles, etc.
-
     def start_firebase_sync(self, db_url):
+        self._sync_version += 1
         self._sync_mode = "firebase"
-        self.root.after(0, lambda: self.sync_label.config(
-            text="⬤ firebase", fg="#72efdd"))
-        t = threading.Thread(
-            target=self._firebase_stream_loop,
-            args=(db_url.rstrip("/"),),
-            daemon=True,
-        )
-        t.start()
+        v = self._sync_version
+        self.root.after(0, self._show_live_badge)
+        threading.Thread(target=self._firebase_loop,
+                         args=(db_url.rstrip("/"), v), daemon=True).start()
 
-    def _firebase_stream_loop(self, db_url):
+    def _firebase_loop(self, db_url, version):
         try:
             import requests
         except ImportError:
-            self.root.after(0, lambda: self.sync_label.config(
-                text="✗ install requests", fg="#ff6b6b"))
             return
-
-        url = f"{db_url}/overlay/content.json"
+        url  = f"{db_url}/overlay/content.json"
         last = None
-        while True:
+        while self._sync_version == version:
             try:
                 r = requests.get(url, timeout=5)
                 if r.ok:
@@ -359,142 +668,358 @@ class OverlayApp:
                     if isinstance(val, str) and val != last:
                         last = val
                         self.root.after(0, lambda c=val: self._apply_remote_content(c))
-                    if not r.ok:
-                        raise Exception(r.status_code)
             except Exception:
-                self.root.after(0, lambda: self.sync_label.config(
-                    text="⬤ reconnecting…", fg=C["dim"]))
                 time.sleep(2)
-                self.root.after(0, lambda: self.sync_label.config(
-                    text="⬤ firebase", fg="#72efdd"))
             time.sleep(0.15)
 
-    # ── REMOTE SYNC — LOCAL WEBSOCKET ────────────────────────────────────────
-    #
-    # Runs an asyncio WebSocket server inside a daemon thread.
-    # The phone/laptop web UI connects to ws://YOUR-IP:8765 and sends the full
-    # notes content each time the user pauses typing (debounced 300ms).
-    # asyncio.run() creates its own event loop inside the thread — the rest
-    # of the app stays fully synchronous.
-
     def start_local_ws_server(self, port=8765):
+        self._sync_version += 1
         self._sync_mode = "local"
-        self.root.after(0, lambda: self.sync_label.config(
-            text=f"⬤ ws:{port}", fg="#f77f00"))
-        t = threading.Thread(
-            target=self._run_ws_server,
-            args=(port,),
-            daemon=True,
-        )
-        t.start()
+        v = self._sync_version
+        self.root.after(0, self._show_live_badge)
+        threading.Thread(target=self._run_ws_server,
+                         args=(port, v), daemon=True).start()
 
-    def _run_ws_server(self, port):
-        asyncio.run(self._ws_serve(port))
+    def _run_ws_server(self, port, version):
+        asyncio.run(self._ws_serve(port, version))
 
-    async def _ws_serve(self, port):
+    async def _ws_serve(self, port, version):
         try:
             import websockets
         except ImportError:
-            self.root.after(0, lambda: self.sync_label.config(
-                text="✗ install websockets", fg="#ff6b6b"))
             return
 
         async def handler(ws):
-            async for message in ws:
-                if isinstance(message, str):
-                    self.root.after(0, lambda c=message: self._apply_remote_content(c))
+            async for msg in ws:
+                if isinstance(msg, str) and self._sync_version == version:
+                    self.root.after(0, lambda c=msg: self._apply_remote_content(c))
 
         async with websockets.serve(handler, "0.0.0.0", port):
-            await asyncio.Future()   # run forever until the process exits
+            while self._sync_version == version:
+                await asyncio.sleep(0.5)
 
-    # ── CONTROLS DROPDOWN ────────────────────────────────────────────────────
+    def stop_sync(self):
+        self._sync_version += 1
+        self._sync_mode = None
+        self.root.after(0, self._hide_live_badge)
 
-    def toggle_controls(self):
-        if self._controls_win and self._controls_win.winfo_exists():
-            self._controls_win.destroy()
-            self._controls_win = None
+    # ── LIVE BADGE ───────────────────────────────────────────────────────────
+
+    def _show_live_badge(self):
+        self._live_frame.pack(side="right", padx=(0, 10),
+                              before=self._gear_btn)
+        self._pulse_live()
+
+    def _hide_live_badge(self):
+        self._live_frame.pack_forget()
+
+    def _pulse_live(self):
+        if not self._sync_mode:
+            return
+        self._live_state = not self._live_state
+        self._live_dot.config(fg=C["primary"] if self._live_state else C["bar"])
+        self.root.after(900, self._pulse_live)
+
+    # ── MEETING TIMER ────────────────────────────────────────────────────────
+
+    def _tick_timer(self):
+        self._elapsed += 1
+        h, m, s = self._elapsed // 3600, (self._elapsed % 3600) // 60, self._elapsed % 60
+        self.timer_label.config(text=f"{h:02d}:{m:02d}:{s:02d}")
+        self.root.after(1000, self._tick_timer)
+
+    # ── AUTO-SCROLL + WORD HIGHLIGHT ─────────────────────────────────────────
+
+    def _build_autoscroll_words(self):
+        self._autoscroll_words    = []
+        self._autoscroll_word_idx = 0
+        self._autoscroll_tick     = 0
+        content = self.text.get("1.0", "end")
+        for m in re.finditer(r'\S+', content):
+            self._autoscroll_words.append((
+                f"1.0 + {m.start()} chars",
+                f"1.0 + {m.end()} chars"))
+
+    def _toggle_autoscroll(self):
+        self._autoscroll_active = not self._autoscroll_active
+        if self._autoscroll_active:
+            self._auto_btn.config(text="⏸  STOP", bg=C["primary"], fg=C["bg"])
+            self._autoscroll_word_idx = 0
+            self._autoscroll_tick     = 0
+            self._autoscroll_step()
+        else:
+            self._auto_btn.config(text="▶  AUTO", bg=C["on_s"], fg=C["bg"])
+            self.text.config(state="normal")
+            self.text.tag_remove("autoscroll_hl", "1.0", "end")
+            self.text.config(state="disabled")
+
+    def _autoscroll_step(self):
+        if not self._autoscroll_active:
+            return
+        self.text.yview_scroll(1, "units")
+        self._autoscroll_tick += 1
+
+        if self._autoscroll_tick % 8 == 0:
+            words = self._autoscroll_words
+            idx   = self._autoscroll_word_idx
+            if words and idx < len(words):
+                self.text.config(state="normal")
+                self.text.tag_remove("autoscroll_hl", "1.0", "end")
+                self.text.tag_add("autoscroll_hl", words[idx][0], words[idx][1])
+                self.text.config(state="disabled")
+                self._autoscroll_word_idx += 1
+            elif idx >= len(words):
+                self._toggle_autoscroll()
+                return
+
+        self.root.after(50, self._autoscroll_step)
+
+    # ── SETTINGS POPUP ───────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        if self._settings_win and self._settings_win.winfo_exists():
+            self._settings_win.destroy()
+            self._settings_win = None
             return
 
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        win.configure(bg=C["bar"])
-
-        self._populate_controls(win)
+        win.configure(bg=C["prompt"])
 
         self.root.update_idletasks()
-        bx = self.menu_btn.winfo_rootx()
-        by = self.menu_btn.winfo_rooty() + self.menu_btn.winfo_height() + 2
-        win.geometry(f"200x120+{bx - 148}+{by}")
-
+        bx = self._gear_btn.winfo_rootx()
+        by = self._gear_btn.winfo_rooty() + self._gear_btn.winfo_height() + 4
+        win.geometry(f"230x280+{bx - 178}+{by}")
         self._cloak(win)
 
-        def _on_focus_out(e):
-            win.after(100, lambda: win.destroy() if win.winfo_exists() else None)
+        _lbl = dict(bg=C["prompt"], fg=C["on_sv"], font=(LABEL, 8))
 
-        win.bind("<FocusOut>", _on_focus_out)
+        # ── OPACITY ──
+        tk.Label(win, text="WINDOW OPACITY", **_lbl).pack(
+            anchor="w", padx=14, pady=(12, 2))
+
+        op_row = tk.Frame(win, bg=C["prompt"])
+        op_row.pack(fill="x", padx=14)
+        self._op_label = tk.Label(op_row,
+            text=f"{int(self.root.attributes('-alpha')*100)}%", **_lbl)
+        self._op_label.pack(side="right")
+
+        tk.Scale(win, from_=20, to=100, resolution=1, orient="horizontal",
+                 showvalue=False, bg=C["prompt"], troughcolor=C["outline"],
+                 highlightthickness=0, bd=0, sliderrelief="flat",
+                 activebackground=C["primary"], command=self._on_opacity
+                 ).pack(fill="x", padx=14)
+
+        tk.Frame(win, bg=C["outline"], height=1).pack(fill="x", padx=14, pady=8)
+
+        # ── SYNC MODE ──
+        tk.Label(win, text="SYNC MODE", **_lbl).pack(anchor="w", padx=14)
+
+        mode_row = tk.Frame(win, bg=C["prompt"])
+        mode_row.pack(fill="x", padx=14, pady=(4, 8))
+
+        self._mode_var   = tk.StringVar(value=self._sync_mode or "none")
+        self._sync_input = None   # will hold the input frame
+
+        def set_sync_ui(mode):
+            self._mode_var.set(mode)
+            # style buttons
+            for m, btn in mode_btns.items():
+                btn.config(bg=C["primary"] if m == mode else C["outline"],
+                           fg=C["bg"]     if m == mode else C["on_sv"])
+            # rebuild input area
+            if self._sync_input and self._sync_input.winfo_exists():
+                self._sync_input.destroy()
+            f = tk.Frame(win, bg=C["prompt"])
+            f.pack(fill="x", padx=14, pady=(0, 4))
+            self._sync_input = f
+            if mode == "firebase":
+                tk.Label(f, text="Database URL", **_lbl).pack(anchor="w")
+                entry = tk.Entry(f, bg=C["card_dim"], fg=C["on_s"],
+                                 insertbackground=C["on_s"],
+                                 relief="flat", font=(SANS, 9), bd=4)
+                entry.pack(fill="x", pady=(2, 4))
+                if self._sync_mode == "firebase":
+                    entry.insert(0, "currently connected")
+                tk.Button(f, text="Connect",
+                          command=lambda: self._connect_firebase(
+                              entry.get(), win),
+                          bg=C["primary"], fg=C["bg"], bd=0,
+                          font=(LABEL, 8, "bold"), relief="flat",
+                          cursor="hand2", pady=4
+                          ).pack(fill="x")
+            elif mode == "local":
+                tk.Label(f, text="Overlay IP : Port", **_lbl).pack(anchor="w")
+                import socket
+                try:    default_ip = socket.gethostbyname(socket.gethostname())
+                except: default_ip = "127.0.0.1"
+                entry = tk.Entry(f, bg=C["card_dim"], fg=C["on_s"],
+                                 insertbackground=C["on_s"],
+                                 relief="flat", font=(SANS, 9), bd=4)
+                entry.insert(0, f"{default_ip}:8765")
+                entry.pack(fill="x", pady=(2, 4))
+                tk.Button(f, text="Start Server",
+                          command=lambda: self._connect_local(
+                              entry.get(), win),
+                          bg=C["primary"], fg=C["bg"], bd=0,
+                          font=(LABEL, 8, "bold"), relief="flat",
+                          cursor="hand2", pady=4
+                          ).pack(fill="x")
+            elif mode == "none":
+                if self._sync_mode:
+                    tk.Button(f, text="Disconnect",
+                              command=lambda: [self.stop_sync(), win.destroy()],
+                              bg=C["outline"], fg=C["on_s"], bd=0,
+                              font=(LABEL, 8, "bold"), relief="flat",
+                              cursor="hand2", pady=4
+                              ).pack(fill="x")
+            # resize popup
+            win.update_idletasks()
+            needed_h = win.winfo_reqheight() + 10
+            win.geometry(f"230x{needed_h}+{bx - 178}+{by}")
+
+        _mb = dict(bd=0, font=(LABEL, 7, "bold"), cursor="hand2",
+                   relief="flat", padx=8, pady=4)
+        mode_btns = {}
+        for mode_val, mode_txt in [("firebase", "☁ Firebase"),
+                                    ("local",    "📡 Local"),
+                                    ("none",     "✕ Off")]:
+            b = tk.Button(mode_row, text=mode_txt,
+                          command=lambda m=mode_val: set_sync_ui(m),
+                          bg=C["outline"], fg=C["on_sv"], **_mb)
+            b.pack(side="left", padx=(0, 3))
+            mode_btns[mode_val] = b
+
+        # Highlight current mode button
+        cur = self._sync_mode if self._sync_mode else "none"
+        mode_btns[cur].config(bg=C["primary"], fg=C["bg"])
+
+        tk.Frame(win, bg=C["outline"], height=1).pack(fill="x", padx=14, pady=(4, 0))
+
+        # ── LOAD FILE ──
+        tk.Button(win, text="📂  Load File",
+                  command=lambda: [win.destroy(), self.load_file()],
+                  bg=C["prompt"], fg=C["on_s"], bd=0,
+                  font=(LABEL, 9), activebackground=C["primary"],
+                  activeforeground=C["bg"], relief="flat",
+                  anchor="w", cursor="hand2", padx=4, pady=8
+                  ).pack(fill="x", padx=14)
+
+        def _maybe_close():
+            if not win.winfo_exists():
+                return
+            # Only close if focus has moved completely outside this popup
+            fw = win.focus_get()
+            if fw is None:
+                win.destroy()
+            # fw is a widget inside win → user clicked an entry/button, keep open
+
+        win.bind("<FocusOut>", lambda e: win.after(200, _maybe_close))
         win.focus_set()
-        self._controls_win = win
+        self._settings_win = win
 
-    def _populate_controls(self, win):
-        _lbl = dict(bg=C["bar"], fg=C["dim"], font=("Segoe UI", 8))
-        _btn = dict(bg=C["border"], fg=C["body"], bd=0, font=("Segoe UI", 9, "bold"),
-                    width=3, cursor="hand2", activebackground=C["accent"],
-                    activeforeground="white", relief="flat")
+    def _connect_firebase(self, url, win):
+        url = url.strip()
+        if not url or url == "currently connected":
+            return
+        win.destroy()
+        self.start_firebase_sync(url)
 
-        row = tk.Frame(win, bg=C["bar"])
-        row.pack(fill="x", padx=10, pady=(8, 4))
-        tk.Label(row, text="Font size", **_lbl).pack(side="left")
-        tk.Button(row, text="A+", command=lambda: self._change_font(1),  **_btn).pack(side="right", padx=(2, 0))
-        tk.Button(row, text="A−", command=lambda: self._change_font(-1), **_btn).pack(side="right")
+    def _connect_local(self, addr, win):
+        addr = addr.strip()
+        win.destroy()
+        port = 8765
+        if ":" in addr:
+            try:
+                port = int(addr.split(":")[-1])
+            except ValueError:
+                pass
+        self.start_local_ws_server(port)
+        import socket
+        try:    ip = socket.gethostbyname(socket.gethostname())
+        except: ip = "127.0.0.1"
+        print(f"WebSocket server on {ip}:{port}")
 
-        tk.Frame(win, bg=C["border"], height=1).pack(fill="x", padx=10)
+    def _on_opacity(self, val):
+        v = int(val)
+        self.root.attributes("-alpha", v / 100)
+        if hasattr(self, "_op_label"):
+            self._op_label.config(text=f"{v}%")
 
-        row2 = tk.Frame(win, bg=C["bar"])
-        row2.pack(fill="x", padx=10, pady=4)
-        tk.Label(row2, text="Opacity", **_lbl).pack(side="left")
-        scale = tk.Scale(
-            row2, from_=0.3, to=1.0, resolution=0.05,
-            orient="horizontal", length=95, showvalue=False,
-            bg=C["bar"], troughcolor=C["border"],
-            highlightthickness=0, bd=0, sliderrelief="flat",
-            command=lambda v: self.root.attributes("-alpha", float(v)),
-        )
-        scale.set(self.root.attributes("-alpha"))
-        scale.pack(side="right")
+    # ── RESIZE HANDLES ───────────────────────────────────────────────────────
 
-        tk.Frame(win, bg=C["border"], height=1).pack(fill="x", padx=10)
+    def _setup_resize_handles(self):
+        CORNER, EDGE = 14, 6
+        for cursor, kw, d in [
+            ("size_ns",    dict(relx=0.5, rely=0,   anchor="n",  relwidth=1.0, height=EDGE),   "n"),
+            ("size_ns",    dict(relx=0.5, rely=1.0, anchor="s",  relwidth=1.0, height=EDGE),   "s"),
+            ("size_we",    dict(relx=0,   rely=0.5, anchor="w",  width=EDGE,   relheight=1.0), "w"),
+            ("size_we",    dict(relx=1.0, rely=0.5, anchor="e",  width=EDGE,   relheight=1.0), "e"),
+            ("size_nw_se", dict(relx=0,   rely=0,   anchor="nw", width=CORNER, height=CORNER), "nw"),
+            ("size_ne_sw", dict(relx=1.0, rely=0,   anchor="ne", width=CORNER, height=CORNER), "ne"),
+            ("size_ne_sw", dict(relx=0,   rely=1.0, anchor="sw", width=CORNER, height=CORNER), "sw"),
+            ("size_nw_se", dict(relx=1.0, rely=1.0, anchor="se", width=CORNER, height=CORNER), "se"),
+        ]:
+            f = tk.Frame(self.root, cursor=cursor, bg=C["bg"])
+            f.place(**kw)
+            f.bind("<ButtonPress-1>", lambda e, dd=d: self._start_resize(e, dd))
+            f.bind("<B1-Motion>",     lambda e, dd=d: self._do_resize(e, dd))
 
-        tk.Button(
-            win, text="📂  Load File",
-            command=lambda: [win.destroy(), self.load_file()],
-            bg=C["bar"], fg=C["body"], bd=0, font=("Segoe UI", 9),
-            activebackground=C["border"], relief="flat", anchor="w",
-            cursor="hand2",
-        ).pack(fill="x", padx=10, pady=(4, 8))
+    def _start_resize(self, event, direction):
+        self._resize_data = dict(
+            start_x=event.x_root, start_y=event.y_root,
+            orig_x=self.root.winfo_x(), orig_y=self.root.winfo_y(),
+            orig_w=self.root.winfo_width(), orig_h=self.root.winfo_height())
+
+    def _do_resize(self, event, direction):
+        if not self._resize_data: return
+        d  = self._resize_data
+        dx = event.x_root - d["start_x"]
+        dy = event.y_root - d["start_y"]
+        x, y, w, h = d["orig_x"], d["orig_y"], d["orig_w"], d["orig_h"]
+        if   direction == "se": w=max(MIN_W,w+dx);  h=max(MIN_H,h+dy)
+        elif direction == "sw": nw=max(MIN_W,w-dx); x+=w-nw; w=nw; h=max(MIN_H,h+dy)
+        elif direction == "ne": w=max(MIN_W,w+dx);  nh=max(MIN_H,h-dy); y+=h-nh; h=nh
+        elif direction == "nw": nw=max(MIN_W,w-dx); x+=w-nw; w=nw; nh=max(MIN_H,h-dy); y+=h-nh; h=nh
+        elif direction == "e":  w=max(MIN_W,w+dx)
+        elif direction == "w":  nw=max(MIN_W,w-dx); x+=w-nw; w=nw
+        elif direction == "s":  h=max(MIN_H,h+dy)
+        elif direction == "n":  nh=max(MIN_H,h-dy); y+=h-nh; h=nh
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    # ── FONT ─────────────────────────────────────────────────────────────────
 
     def _change_font(self, delta):
         self.font_size = max(8, min(24, self.font_size + delta))
         self._configure_tags()
+        self._prev_text.config(font=(SERIF, self.font_size - 2, "italic"))
+        self._next_text.config(font=(SANS,  self.font_size - 2))
+        self.text.config(font=(SANS, self.font_size))
         self.render_slide()
 
     # ── DRAG ─────────────────────────────────────────────────────────────────
 
     def _start_drag(self, event):
-        self._drag_x = event.x
-        self._drag_y = event.y
+        self._drag_x = event.x_root - self.root.winfo_x()
+        self._drag_y = event.y_root - self.root.winfo_y()
 
     def _do_drag(self, event):
-        x = self.root.winfo_x() + (event.x - self._drag_x)
-        y = self.root.winfo_y() + (event.y - self._drag_y)
-        self.root.geometry(f"+{x}+{y}")
+        self.root.geometry(
+            f"+{event.x_root-self._drag_x}+{event.y_root-self._drag_y}")
 
-    # ── MISC ─────────────────────────────────────────────────────────────────
+    # ── KEY BINDINGS ─────────────────────────────────────────────────────────
+
+    def _bind_keys(self):
+        self.root.bind("<Left>",   lambda e: self.navigate(-1))
+        self.root.bind("<Right>",  lambda e: self.navigate(1))
+        self.root.bind("<Escape>", self._handle_escape)
 
     def _handle_escape(self, event):
-        if self._controls_win and self._controls_win.winfo_exists():
-            self._controls_win.destroy()
-            self._controls_win = None
+        if self._settings_win and self._settings_win.winfo_exists():
+            self._settings_win.destroy()
+        elif self._logs_visible:
+            self._hide_logs()
         else:
             self.root.destroy()
 
@@ -503,26 +1028,20 @@ class OverlayApp:
 
 def main():
     root = tk.Tk()
-    app = OverlayApp(root)
+    app  = OverlayApp(root)
 
     args = sys.argv[1:]
-
     if "--firebase" in args:
-        db_url = args[args.index("--firebase") + 1]
-        app.start_firebase_sync(db_url)
+        app.start_firebase_sync(args[args.index("--firebase") + 1])
     elif "--local" in args:
         port = 8765
         if "--port" in args:
             port = int(args[args.index("--port") + 1])
         app.start_local_ws_server(port)
-        # Print the local IP so the user knows what to type in the web UI
         import socket
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-        except Exception:
-            ip = "127.0.0.1"
-        print(f"Local WebSocket server started.")
-        print(f"Open the web UI and enter: {ip}:{port}")
+        try:    ip = socket.gethostbyname(socket.gethostname())
+        except: ip = "127.0.0.1"
+        print(f"Local WebSocket server started.\nOpen the web UI and enter: {ip}:{port}")
     elif args and not args[0].startswith("--"):
         app.load_file(args[0])
 
