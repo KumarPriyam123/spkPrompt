@@ -40,6 +40,7 @@ class OverlayApp:
         self._resize_data   = None
         self._sync_mode     = None
         self._sync_version  = 0          # increments to cancel old sync threads
+        self._firebase_url  = ""         # last connected Firebase URL
         self._settings_win  = None
         self._logs_visible  = False
         self._logs_frame    = None
@@ -75,7 +76,12 @@ class OverlayApp:
         window.update()
         inner = window.winfo_id()
         hwnd  = ctypes.windll.user32.GetParent(inner) or inner
-        self._user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        ret   = self._user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        if ret == 0:
+            err = ctypes.get_last_error()
+            print(f"WARNING: screen-capture cloaking failed "
+                  f"(HWND={hwnd:#x}, error={err}). "
+                  "The overlay may be visible in screen shares.")
 
     def _minimize(self):
         """Minimize via the overrideredirect toggle trick."""
@@ -646,12 +652,13 @@ class OverlayApp:
         self.render_slide()
 
     def start_firebase_sync(self, db_url):
+        self._firebase_url  = db_url.rstrip("/")
         self._sync_version += 1
         self._sync_mode = "firebase"
         v = self._sync_version
         self.root.after(0, self._show_live_badge)
         threading.Thread(target=self._firebase_loop,
-                         args=(db_url.rstrip("/"), v), daemon=True).start()
+                         args=(self._firebase_url, v), daemon=True).start()
 
     def _firebase_loop(self, db_url, version):
         try:
@@ -668,9 +675,11 @@ class OverlayApp:
                     if isinstance(val, str) and val != last:
                         last = val
                         self.root.after(0, lambda c=val: self._apply_remote_content(c))
-            except Exception:
+            except Exception as e:
+                print(f"[Firebase] {type(e).__name__}: {e}")
                 time.sleep(2)
-            time.sleep(0.15)
+                continue
+            time.sleep(0.75)   # ~1.3 req/sec — responsive but won't hit rate limits
 
     def start_local_ws_server(self, port=8765):
         self._sync_version += 1
@@ -689,9 +698,14 @@ class OverlayApp:
         except ImportError:
             return
 
+        MAX_MSG = 500_000   # 500 KB — guard against oversized / malicious payloads
+
         async def handler(ws):
             async for msg in ws:
                 if isinstance(msg, str) and self._sync_version == version:
+                    if len(msg) > MAX_MSG:
+                        print(f"[WebSocket] message dropped: {len(msg):,} bytes exceeds limit")
+                        continue
                     self.root.after(0, lambda c=msg: self._apply_remote_content(c))
 
         async with websockets.serve(handler, "0.0.0.0", port):
@@ -723,6 +737,8 @@ class OverlayApp:
     # ── MEETING TIMER ────────────────────────────────────────────────────────
 
     def _tick_timer(self):
+        if not self.root.winfo_exists():
+            return
         self._elapsed += 1
         h, m, s = self._elapsed // 3600, (self._elapsed % 3600) // 60, self._elapsed % 60
         self.timer_label.config(text=f"{h:02d}:{m:02d}:{s:02d}")
@@ -844,8 +860,8 @@ class OverlayApp:
                                  insertbackground=C["on_s"],
                                  relief="flat", font=(SANS, 9), bd=4)
                 entry.pack(fill="x", pady=(2, 4))
-                if self._sync_mode == "firebase":
-                    entry.insert(0, "currently connected")
+                if self._sync_mode == "firebase" and self._firebase_url:
+                    entry.insert(0, self._firebase_url)
                 tk.Button(f, text="Connect",
                           command=lambda: self._connect_firebase(
                               entry.get(), win),
@@ -925,7 +941,7 @@ class OverlayApp:
 
     def _connect_firebase(self, url, win):
         url = url.strip()
-        if not url or url == "currently connected":
+        if not url:
             return
         win.destroy()
         self.start_firebase_sync(url)
