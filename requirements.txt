@@ -1,2 +1,5 @@
 requests>=2.28,<3
 websockets>=11,<17
+# voice sync (optional — only needed for the 🎤 SYNC feature)
+vosk>=0.3.45
+sounddevice>=0.4.6

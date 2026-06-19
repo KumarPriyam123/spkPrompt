@@ -41,6 +41,11 @@ class OverlayApp:
         self._sync_mode     = None
         self._sync_version  = 0          # increments to cancel old sync threads
         self._firebase_url  = ""         # last connected Firebase URL
+        self._last_synced   = None       # last content seen/sent over sync (echo guard)
+        self._edit_guard_until = 0       # ignore inbound sync briefly after a local edit
+        self._editing       = False      # active-card edit mode flag
+        self._ws_clients    = set()      # connected local-WS clients
+        self._ws_loop       = None       # the asyncio loop running the WS server
         self._settings_win  = None
         self._logs_visible  = False
         self._logs_frame    = None
@@ -48,9 +53,14 @@ class OverlayApp:
         self._live_state    = True
 
         self._autoscroll_active   = False
-        self._autoscroll_words    = []
-        self._autoscroll_word_idx = 0
+        self._autoscroll_words    = []   # parallel: (start_idx, end_idx) tk positions
+        self._word_texts          = []   # parallel: normalized word strings (voice match)
+        self._autoscroll_word_idx = 0    # shared highlight pointer (auto + voice + seek)
         self._autoscroll_tick     = 0
+
+        self._voice_active        = False
+        self._voice_version       = 0    # increments to cancel old mic threads
+        self._voice_spoken_count  = 0    # words consumed from the current partial
 
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -276,6 +286,14 @@ class OverlayApp:
             padx=10, pady=4)
         self._auto_btn.pack(side="left")
 
+        self._voice_btn = tk.Button(
+            right, text="🎤  SYNC", command=self._toggle_voice,
+            bg=C["on_s"], fg=C["bg"], bd=0, font=(LABEL, 8, "bold"),
+            cursor="hand2", relief="flat",
+            activebackground=C["primary"], activeforeground=C["bg"],
+            padx=10, pady=4)
+        self._voice_btn.pack(side="left", padx=(6, 0))
+
     # ── VIEWPORT — three distinct card boxes ─────────────────────────────────
     #
     # Layout uses grid so we can show/hide prev & next cards cleanly.
@@ -347,6 +365,7 @@ class OverlayApp:
             selectbackground=C["outline"],
             insertwidth=0)
         self.text.grid(row=1, column=0, sticky="nsew")
+        self.text.bind("<Button-1>", self._on_text_click)
         self._configure_tags()
 
         # ── NEXT CARD ──
@@ -550,6 +569,8 @@ class OverlayApp:
     # ── NAVIGATION ───────────────────────────────────────────────────────────
 
     def navigate(self, delta):
+        if self._editing:
+            return
         new = self.current + delta
         if 0 <= new < len(self.slides):
             self.current = new
@@ -559,6 +580,103 @@ class OverlayApp:
         if 0 <= index < len(self.slides):
             self.current = index
             self.render_slide()
+
+    # ── INLINE EDITING (two-way sync) ────────────────────────────────────────
+
+    def _on_text_click(self, event):
+        """Single click on the active card.
+
+        While following along (voice / auto-scroll) a click re-seeks the
+        highlight to that word. Otherwise it drops straight into edit mode
+        with the caret placed where you clicked.
+        """
+        if self._editing:
+            return              # already editing — let default caret placement run
+        if self._voice_active or self._autoscroll_active:
+            return self._seek_word(event)
+        self._enter_edit_mode(event)
+        return "break"          # we place the caret ourselves
+
+    def _enter_edit_mode(self, event=None):
+        """Edit the raw markdown of the current slide, caret at the click point."""
+        if self._editing:
+            return
+        if self._autoscroll_active:
+            self._toggle_autoscroll()
+        if self._voice_active:
+            self._stop_voice()
+        self._editing = True
+        self.text.config(state="normal", cursor="xterm",
+                         insertwidth=2, insertbackground=C["primary"])
+        self.text.delete("1.0", "end")
+        for tag in ("h1", "h2", "body", "bold", "bullet",
+                    "prompt_header", "prompt_body", "keyword", "autoscroll_hl"):
+            self.text.tag_remove(tag, "1.0", "end")
+        self.text.insert("1.0", self.slides[self.current])
+        self._manuscript_lbl.config(
+            text=f"✏  EDITING  ·  SLIDE {self.current + 1}  ·  Esc or click away to save")
+        self.text.focus_set()
+        # Place the caret at the clicked screen position within the raw text.
+        if event is not None:
+            try:
+                self.text.mark_set("insert",
+                                   self.text.index(f"@{event.x},{event.y}"))
+            except tk.TclError:
+                pass
+        self.text.see("insert")
+        self.text.bind("<FocusOut>", self._commit_edit)
+        self.text.bind("<Escape>",   self._commit_edit)
+
+    def _commit_edit(self, event=None):
+        if not self._editing:
+            return
+        self._editing = False
+        new_content = self.text.get("1.0", "end-1c")
+        self.text.unbind("<FocusOut>")
+        self.text.unbind("<Escape>")
+        self.text.config(cursor="arrow", insertwidth=0)
+        # An edit may introduce `---` separators — re-split the edited slide.
+        pieces = [s.strip() for s in re.split(r'\n\s*---\s*\n', new_content)
+                  if s.strip()]
+        if not pieces:
+            pieces = [""]
+        self.slides[self.current:self.current + 1] = pieces
+        self.render_slide()
+        self._broadcast_content()
+        return "break"
+
+    # ── OUTBOUND BROADCAST ───────────────────────────────────────────────────
+
+    def _broadcast_content(self):
+        """Push the current deck back out to whichever sync mode is active."""
+        content = "\n---\n".join(self.slides)
+        self._last_synced = content        # echo guard for inbound listeners
+        self._edit_guard_until = time.time() + 1.5   # ride out the PUT round-trip
+        if self._sync_mode == "firebase":
+            threading.Thread(target=self._firebase_put,
+                             args=(content,), daemon=True).start()
+        elif self._sync_mode == "local":
+            if self._ws_loop and self._ws_clients:
+                self._ws_loop.call_soon_threadsafe(self._ws_broadcast, content)
+
+    def _firebase_put(self, content):
+        try:
+            import requests
+            requests.put(f"{self._firebase_url}/overlay/content.json",
+                         data=json.dumps(content), timeout=5)
+        except Exception as e:
+            print(f"[Firebase] push failed: {type(e).__name__}: {e}")
+
+    def _ws_broadcast(self, content):
+        """Runs inside the WS asyncio loop — fan out to all clients."""
+        for ws in list(self._ws_clients):
+            asyncio.create_task(self._ws_send_safe(ws, content))
+
+    async def _ws_send_safe(self, ws, content):
+        try:
+            await ws.send(content)
+        except Exception:
+            self._ws_clients.discard(ws)
 
     # ── FILE LOADING ─────────────────────────────────────────────────────────
 
@@ -642,6 +760,8 @@ class OverlayApp:
     # ── REMOTE SYNC ──────────────────────────────────────────────────────────
 
     def _apply_remote_content(self, content):
+        if self._editing or time.time() < self._edit_guard_until:
+            return              # don't clobber an in-progress / just-finished local edit
         content = content.replace('\r\n', '\n').replace('\r', '\n')
         parsed  = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
                    if s.strip()]
@@ -666,14 +786,13 @@ class OverlayApp:
         except ImportError:
             return
         url  = f"{db_url}/overlay/content.json"
-        last = None
         while self._sync_version == version:
             try:
                 r = requests.get(url, timeout=5)
                 if r.ok:
                     val = r.json()
-                    if isinstance(val, str) and val != last:
-                        last = val
+                    if isinstance(val, str) and val != self._last_synced:
+                        self._last_synced = val
                         self.root.after(0, lambda c=val: self._apply_remote_content(c))
             except Exception as e:
                 print(f"[Firebase] {type(e).__name__}: {e}")
@@ -700,17 +819,27 @@ class OverlayApp:
 
         MAX_MSG = 500_000   # 500 KB — guard against oversized / malicious payloads
 
+        self._ws_loop    = asyncio.get_running_loop()
+        self._ws_clients = set()
+
         async def handler(ws):
-            async for msg in ws:
-                if isinstance(msg, str) and self._sync_version == version:
-                    if len(msg) > MAX_MSG:
-                        print(f"[WebSocket] message dropped: {len(msg):,} bytes exceeds limit")
-                        continue
-                    self.root.after(0, lambda c=msg: self._apply_remote_content(c))
+            self._ws_clients.add(ws)
+            try:
+                async for msg in ws:
+                    if isinstance(msg, str) and self._sync_version == version:
+                        if len(msg) > MAX_MSG:
+                            print(f"[WebSocket] message dropped: {len(msg):,} bytes exceeds limit")
+                            continue
+                        self._last_synced = msg
+                        self.root.after(0, lambda c=msg: self._apply_remote_content(c))
+            finally:
+                self._ws_clients.discard(ws)
 
         async with websockets.serve(handler, "0.0.0.0", port):
             while self._sync_version == version:
                 await asyncio.sleep(0.5)
+        self._ws_clients.clear()
+        self._ws_loop = None
 
     def stop_sync(self):
         self._sync_version += 1
@@ -748,6 +877,7 @@ class OverlayApp:
 
     def _build_autoscroll_words(self):
         self._autoscroll_words    = []
+        self._word_texts          = []
         self._autoscroll_word_idx = 0
         self._autoscroll_tick     = 0
         content = self.text.get("1.0", "end")
@@ -755,10 +885,17 @@ class OverlayApp:
             self._autoscroll_words.append((
                 f"1.0 + {m.start()} chars",
                 f"1.0 + {m.end()} chars"))
+            self._word_texts.append(self._normalize_word(m.group()))
+
+    @staticmethod
+    def _normalize_word(w):
+        return re.sub(r'[^a-z0-9]', '', w.lower())
 
     def _toggle_autoscroll(self):
         self._autoscroll_active = not self._autoscroll_active
         if self._autoscroll_active:
+            if self._voice_active:
+                self._stop_voice()           # auto + voice are mutually exclusive
             self._auto_btn.config(text="⏸  STOP", bg=C["primary"], fg=C["bg"])
             self._autoscroll_word_idx = 0
             self._autoscroll_tick     = 0
@@ -783,16 +920,182 @@ class OverlayApp:
             words = self._autoscroll_words
             idx   = self._autoscroll_word_idx
             if words and idx < len(words):
-                self.text.config(state="normal")
-                self.text.tag_remove("autoscroll_hl", "1.0", "end")
-                self.text.tag_add("autoscroll_hl", words[idx][0], words[idx][1])
-                self.text.config(state="disabled")
+                self._highlight_word(idx, scroll=False)
                 self._autoscroll_word_idx += 1
             elif idx >= len(words):
                 self._toggle_autoscroll()
                 return
 
         self.root.after(80, self._autoscroll_step)
+
+    def _highlight_word(self, p, scroll=True):
+        """Move the active-word highlight to word index p (shared by auto + voice)."""
+        if not (0 <= p < len(self._autoscroll_words)):
+            return
+        a, b = self._autoscroll_words[p]
+        self.text.config(state="normal")
+        self.text.tag_remove("autoscroll_hl", "1.0", "end")
+        self.text.tag_add("autoscroll_hl", a, b)
+        self.text.config(state="disabled")
+        if scroll:
+            self.text.see(a)
+
+    # ── VOICE SYNC (Vosk) ────────────────────────────────────────────────────
+
+    def _toggle_voice(self):
+        if self._voice_active:
+            self._stop_voice()
+        else:
+            self._start_voice()
+
+    def _start_voice(self):
+        if self._autoscroll_active:
+            self._toggle_autoscroll()        # auto + voice are mutually exclusive
+        self._voice_active   = True
+        self._voice_version += 1
+        self._voice_btn.config(text="⏹  LISTENING", bg=C["primary"], fg=C["bg"])
+        threading.Thread(target=self._voice_loop,
+                         args=(self._voice_version,), daemon=True).start()
+
+    def _stop_voice(self):
+        self._voice_active   = False
+        self._voice_version += 1
+        self._voice_btn.config(text="🎤  SYNC", bg=C["on_s"], fg=C["bg"])
+        self.text.config(state="normal")
+        self.text.tag_remove("autoscroll_hl", "1.0", "end")
+        self.text.config(state="disabled")
+
+    def _voice_error(self, msg):
+        self._voice_active = False
+        self._voice_btn.config(text="🎤  SYNC", bg=C["on_s"], fg=C["bg"])
+        print(f"[Voice] {msg}")
+
+    def _find_vosk_model(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        candidates = []
+        env = os.environ.get("VOSK_MODEL")
+        if env:
+            candidates.append(env)
+        candidates.append(os.path.join(base, "model"))
+        try:
+            for name in sorted(os.listdir(base)):
+                if name.startswith("vosk-model") and \
+                   os.path.isdir(os.path.join(base, name)):
+                    candidates.append(os.path.join(base, name))
+        except OSError:
+            pass
+        for c in candidates:
+            if c and os.path.isdir(c):
+                return c
+        return None
+
+    def _voice_loop(self, version):
+        try:
+            import sounddevice as sd
+            from vosk import Model, KaldiRecognizer, SetLogLevel
+        except ImportError:
+            self.root.after(0, lambda: self._voice_error(
+                "vosk / sounddevice not installed — run: pip install -r requirements.txt"))
+            return
+
+        model_path = self._find_vosk_model()
+        if not model_path:
+            self.root.after(0, lambda: self._voice_error(
+                "Vosk model not found. Download 'vosk-model-small-en-us' and unzip it "
+                "next to overlay.py (as 'model/' or 'vosk-model-...'), "
+                "or set VOSK_MODEL=<path>."))
+            return
+
+        try:
+            SetLogLevel(-1)                  # silence Kaldi's verbose stderr
+            model = Model(model_path)
+            rec   = KaldiRecognizer(model, 16000)
+            self._voice_spoken_count = 0
+            with sd.RawInputStream(samplerate=16000, blocksize=1600,
+                                   dtype="int16", channels=1) as stream:
+                while self._voice_version == version:
+                    data, _ = stream.read(1600)
+                    buf = bytes(data)
+                    if rec.AcceptWaveform(buf):
+                        txt = json.loads(rec.Result()).get("text", "")
+                        self._on_voice_text(txt, final=True)
+                    else:
+                        txt = json.loads(rec.PartialResult()).get("partial", "")
+                        self._on_voice_text(txt, final=False)
+        except Exception as e:
+            self.root.after(0, lambda m=f"{type(e).__name__}: {e}":
+                            self._voice_error(m))
+
+    def _on_voice_text(self, text, final):
+        """Runs in the mic thread — extract newly-spoken words, dispatch to UI."""
+        if not self._voice_active:
+            return
+        words = text.split()
+        if final:
+            new = words[self._voice_spoken_count:]
+            self._voice_spoken_count = 0
+        else:
+            stable = words[:-1]              # last word of a partial is unstable
+            new    = stable[self._voice_spoken_count:]
+            self._voice_spoken_count = len(stable)
+        for w in new:
+            nw = self._normalize_word(w)
+            if nw:
+                self.root.after(0, lambda x=nw: self._voice_advance(x))
+
+    def _voice_advance(self, spoken):
+        """Runs on the main thread — match a spoken word forward, move highlight."""
+        if not self._voice_active:
+            return
+        words = self._word_texts
+        idx   = self._autoscroll_word_idx
+        n     = len(words)
+        if idx >= n:
+            return
+        end   = min(n, idx + 15)            # 15-word lookahead
+        match = -1
+        for p in range(idx, end):           # exact match first
+            if words[p] == spoken:
+                match = p
+                break
+        if match < 0 and len(spoken) >= 4:  # then fuzzy (skip very short words)
+            for p in range(idx, end):
+                wt = words[p]
+                if wt and abs(len(wt) - len(spoken)) <= 2 and \
+                   self._lev(wt, spoken) <= 2:
+                    match = p
+                    break
+        if match >= 0:
+            self._highlight_word(match)
+            self._autoscroll_word_idx = match + 1
+
+    @staticmethod
+    def _lev(a, b):
+        """Levenshtein distance, early-exit beyond the matcher's threshold of 2."""
+        if a == b:
+            return 0
+        if abs(len(a) - len(b)) > 2:
+            return 3
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cost = 0 if ca == cb else 1
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost))
+            prev = cur
+        return prev[len(b)]
+
+    def _seek_word(self, event):
+        """Click a word while following along → move the highlight pointer there."""
+        if self._editing:
+            return "break"
+        click = self.text.index(f"@{event.x},{event.y}")
+        for p, (a, b) in enumerate(self._autoscroll_words):
+            if self.text.compare(click, ">=", a) and self.text.compare(click, "<", b):
+                self._autoscroll_word_idx = p
+                self._highlight_word(p)
+                break
+        return "break"
 
     # ── SETTINGS POPUP ───────────────────────────────────────────────────────
 
