@@ -747,6 +747,7 @@ let ws = null, debounceTimer = null, typingTimer = null;
 let topCollapsed = false;
 let fbPollTimer = null, lastRemoteText = null;   // two-way sync: pick up overlay edits
 let lastTypedAt = 0;                             // suppress remote pull right after local typing
+let presenceTimer = null;                        // heartbeat so the overlay knows we're here
 
 const editor       = document.getElementById("editor");
 const hlLayer      = document.getElementById("hl-layer");
@@ -829,7 +830,7 @@ function setMode(m) {
   setStatus("","DISCONNECTED"); setModeLabel(m);
   setBtnState(document.getElementById("fb-connect-btn"),"idle");
   setBtnState(document.getElementById("ws-connect-btn"),"idle");
-  if (m==="local") { disconnectWS(); stopFbPoll(); }
+  if (m==="local") { disconnectWS(); stopFbPoll(); stopPresence(); }
   localStorage.setItem("overlay-mode", m);
 }
 
@@ -986,6 +987,7 @@ async function fbConnect(){
     setBtnState(btn,"connected");
     localStorage.setItem("overlay-fb-url",url);
     startFbPoll();
+    startPresence();
     setTimeout(collapseTop, 900);
   } catch { setStatus("error","FAILED"); setBtnState(btn,"failed"); }
 }
@@ -999,8 +1001,16 @@ function setBtnState(btn,state){
   else if(state==="failed"){ btn.classList.add("is-failed"); btn.textContent="Retry Connection"; }
   else { btn.textContent="Establish Connection"; }
 }
-function startFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=setInterval(fbPoll,1500); }
+function startFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=setInterval(fbPoll,800); }
 function stopFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=null; }
+// Presence heartbeat — lets the overlay show LIVE SYNCING only while we're actually here
+function startPresence(){ clearInterval(presenceTimer); fbBeat(); presenceTimer=setInterval(fbBeat,3000); }
+function stopPresence(){ clearInterval(presenceTimer); presenceTimer=null; }
+async function fbBeat(){
+  const url=getDbUrl(); if(!url||mode!=="firebase") return;
+  try{ await fetch(`${url}/overlay/presence.json`,
+    {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(Date.now())}); } catch {}
+}
 async function fbPoll(){
   const url=getDbUrl(); if(!url||mode!=="firebase") return;
   try{

@@ -43,7 +43,11 @@ class OverlayApp:
         self._firebase_url  = ""         # last connected Firebase URL
         self._last_synced   = None       # last content seen/sent over sync (echo guard)
         self._edit_guard_until = 0       # ignore inbound sync briefly after a local edit
+        self._fb_last_ok    = 0          # time of last successful Firebase poll (badge health)
+        self._fb_presence_val = None     # last phone heartbeat value seen
+        self._fb_presence_at  = 0        # local time that heartbeat last changed (peer-present)
         self._editing       = False      # active-card edit mode flag
+        self._live_after    = None       # debounce id for live edit broadcasts
         self._ws_clients    = set()      # connected local-WS clients
         self._ws_loop       = None       # the asyncio loop running the WS server
         self._settings_win  = None
@@ -57,6 +61,8 @@ class OverlayApp:
         self._word_texts          = []   # parallel: normalized word strings (voice match)
         self._autoscroll_word_idx = 0    # shared highlight pointer (auto + voice + seek)
         self._autoscroll_tick     = 0
+        self._autoscroll_wpm      = 130  # teleprompter pace (words/min), slider-controlled
+        self._autoscroll_after    = None # pending after() id, so speed changes apply live
 
         self._voice_active        = False
         self._voice_version       = 0    # increments to cancel old mic threads
@@ -176,9 +182,10 @@ class OverlayApp:
                                     fg=C["primary"], bg=C["bar"],
                                     font=(SANS, 7))
         self._live_dot.pack(side="left")
-        tk.Label(self._live_frame, text="LIVE SYNCING",
-                 bg=C["bar"], fg=C["primary"],
-                 font=(LABEL, 7, "bold")).pack(side="left", padx=(3, 0))
+        self._live_label = tk.Label(self._live_frame, text="LIVE SYNCING",
+                                    bg=C["bar"], fg=C["primary"],
+                                    font=(LABEL, 7, "bold"))
+        self._live_label.pack(side="left", padx=(3, 0))
 
     # ── BODY ─────────────────────────────────────────────────────────────────
 
@@ -293,6 +300,22 @@ class OverlayApp:
             activebackground=C["primary"], activeforeground=C["bg"],
             padx=10, pady=4)
         self._voice_btn.pack(side="left", padx=(6, 0))
+
+        # Auto-scroll speed (words per minute)
+        tk.Label(right, text="SPEED", bg=C["bar"], fg=C["muted"],
+                 font=(LABEL, 7, "bold")).pack(side="left", padx=(12, 4))
+        self._speed_scale = tk.Scale(
+            right, from_=60, to=320, orient="horizontal",
+            showvalue=False, length=80, width=14, sliderlength=18,
+            bg=C["bar"], troughcolor=C["card_act"], highlightthickness=0,
+            bd=0, sliderrelief="raised", activebackground=C["primary"],
+            cursor="hand2", command=self._on_speed_change)
+        self._speed_scale.set(self._autoscroll_wpm)
+        self._speed_scale.pack(side="left")
+        self._speed_label = tk.Label(right, text=str(self._autoscroll_wpm),
+                                     bg=C["bar"], fg=C["on_sv"],
+                                     font=(LABEL, 8, "bold"), width=3, anchor="w")
+        self._speed_label.pack(side="left", padx=(4, 0))
 
     # ── VIEWPORT — three distinct card boxes ─────────────────────────────────
     #
@@ -517,13 +540,10 @@ class OverlayApp:
                 else:                                self._insert_rich(line,      "body")
 
     def render_slide(self):
-        # Stop autoscroll
-        if self._autoscroll_active:
-            self._autoscroll_active = False
-            self._auto_btn.config(text="▶  AUTO", bg=C["on_s"], fg=C["bg"])
-            self.text.config(state="normal")
-            self.text.tag_remove("autoscroll_hl", "1.0", "end")
-            self.text.config(state="disabled")
+        # NOTE: do NOT stop auto-scroll / voice here. render_slide() runs on every
+        # remote sync update too — killing the highlight on each Firebase poll is
+        # what broke "click a word and keep scrolling". Following is stopped only
+        # on real navigation (see navigate / navigate_to / load_file).
 
         # ── PREV CARD ──
         if self.current > 0:
@@ -568,16 +588,32 @@ class OverlayApp:
 
     # ── NAVIGATION ───────────────────────────────────────────────────────────
 
+    def _stop_following(self):
+        """Stop auto-scroll / voice and clear the highlight (used on navigation)."""
+        if self._autoscroll_active:
+            self._autoscroll_active = False
+            if self._autoscroll_after:
+                self.root.after_cancel(self._autoscroll_after)
+                self._autoscroll_after = None
+            self._auto_btn.config(text="▶  AUTO", bg=C["on_s"], fg=C["bg"])
+        if self._voice_active:
+            self._stop_voice()
+        self.text.config(state="normal")
+        self.text.tag_remove("autoscroll_hl", "1.0", "end")
+        self.text.config(state="disabled")
+
     def navigate(self, delta):
         if self._editing:
             return
         new = self.current + delta
         if 0 <= new < len(self.slides):
+            self._stop_following()
             self.current = new
             self.render_slide()
 
     def navigate_to(self, index):
         if 0 <= index < len(self.slides):
+            self._stop_following()
             self.current = index
             self.render_slide()
 
@@ -626,14 +662,19 @@ class OverlayApp:
         self.text.see("insert")
         self.text.bind("<FocusOut>", self._commit_edit)
         self.text.bind("<Escape>",   self._commit_edit)
+        self.text.bind("<KeyRelease>", self._on_edit_key)
 
     def _commit_edit(self, event=None):
         if not self._editing:
             return
         self._editing = False
+        if self._live_after:
+            self.root.after_cancel(self._live_after)
+            self._live_after = None
         new_content = self.text.get("1.0", "end-1c")
         self.text.unbind("<FocusOut>")
         self.text.unbind("<Escape>")
+        self.text.unbind("<KeyRelease>")
         self.text.config(cursor="arrow", insertwidth=0)
         # An edit may introduce `---` separators — re-split the edited slide.
         pieces = [s.strip() for s in re.split(r'\n\s*---\s*\n', new_content)
@@ -647,9 +688,10 @@ class OverlayApp:
 
     # ── OUTBOUND BROADCAST ───────────────────────────────────────────────────
 
-    def _broadcast_content(self):
-        """Push the current deck back out to whichever sync mode is active."""
-        content = "\n---\n".join(self.slides)
+    def _broadcast_content(self, content=None):
+        """Push content (defaults to the committed deck) out to the active sync mode."""
+        if content is None:
+            content = "\n---\n".join(self.slides)
         self._last_synced = content        # echo guard for inbound listeners
         self._edit_guard_until = time.time() + 1.5   # ride out the PUT round-trip
         if self._sync_mode == "firebase":
@@ -658,6 +700,25 @@ class OverlayApp:
         elif self._sync_mode == "local":
             if self._ws_loop and self._ws_clients:
                 self._ws_loop.call_soon_threadsafe(self._ws_broadcast, content)
+
+    def _on_edit_key(self, event=None):
+        """Keystroke while editing → schedule a debounced live broadcast."""
+        if self._live_after:
+            self.root.after_cancel(self._live_after)
+        self._live_after = self.root.after(220, self._live_broadcast)
+
+    def _live_broadcast(self):
+        """Send the in-progress edit buffer (uncommitted) to the web UI live."""
+        self._live_after = None
+        if not self._editing:
+            return
+        buffer = self.text.get("1.0", "end-1c")
+        parts  = list(self.slides)
+        if 0 <= self.current < len(parts):
+            parts[self.current] = buffer
+        else:
+            parts = [buffer]
+        self._broadcast_content("\n---\n".join(parts))
 
     def _firebase_put(self, content):
         try:
@@ -693,6 +754,7 @@ class OverlayApp:
                         if s.strip()]
         self.slides  = parsed if parsed else ["# Empty file\n\nNo slides found."]
         self.current = 0
+        self._stop_following()
         self.render_slide()
         self.root.focus_force()
 
@@ -762,6 +824,7 @@ class OverlayApp:
     def _apply_remote_content(self, content):
         if self._editing or time.time() < self._edit_guard_until:
             return              # don't clobber an in-progress / just-finished local edit
+        self._last_synced = content   # mark seen only now that we're actually applying
         content = content.replace('\r\n', '\n').replace('\r', '\n')
         parsed  = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
                    if s.strip()]
@@ -785,20 +848,36 @@ class OverlayApp:
             import requests
         except ImportError:
             return
-        url  = f"{db_url}/overlay/content.json"
+        # Poll the parent node so one request returns both the notes content and
+        # the phone's presence heartbeat (written by the web UI while it's open).
+        url  = f"{db_url}/overlay.json"
         while self._sync_version == version:
             try:
                 r = requests.get(url, timeout=5)
                 if r.ok:
-                    val = r.json()
-                    if isinstance(val, str) and val != self._last_synced:
-                        self._last_synced = val
-                        self.root.after(0, lambda c=val: self._apply_remote_content(c))
+                    self._fb_last_ok = time.time()
+                    data = r.json()
+                    if isinstance(data, dict):
+                        content  = data.get("content")
+                        presence = data.get("presence")
+                    elif isinstance(data, str):       # backward-compat (flat content)
+                        content, presence = data, None
+                    else:
+                        content, presence = None, None
+                    # "peer present" = heartbeat keeps changing; track when it last did
+                    if presence is not None and presence != self._fb_presence_val:
+                        self._fb_presence_val = presence
+                        self._fb_presence_at  = time.time()
+                    # NOTE: don't mark content as seen here — _apply_remote_content does
+                    # that only when it actually applies, so an update that arrives
+                    # mid-edit is retried (not silently dropped) once editing ends.
+                    if isinstance(content, str) and content != self._last_synced:
+                        self.root.after(0, lambda c=content: self._apply_remote_content(c))
             except Exception as e:
                 print(f"[Firebase] {type(e).__name__}: {e}")
                 time.sleep(2)
                 continue
-            time.sleep(0.75)   # ~1.3 req/sec — responsive but won't hit rate limits
+            time.sleep(0.4)    # ~2.5 req/s — snappier pickup, still well under rate limits
 
     def start_local_ws_server(self, port=8765):
         self._sync_version += 1
@@ -830,7 +909,6 @@ class OverlayApp:
                         if len(msg) > MAX_MSG:
                             print(f"[WebSocket] message dropped: {len(msg):,} bytes exceeds limit")
                             continue
-                        self._last_synced = msg
                         self.root.after(0, lambda c=msg: self._apply_remote_content(c))
             finally:
                 self._ws_clients.discard(ws)
@@ -856,12 +934,30 @@ class OverlayApp:
     def _hide_live_badge(self):
         self._live_frame.pack_forget()
 
+    def _sync_health(self):
+        """Return (live, label, color). `live` (a peer is actively present) → pulse."""
+        if self._sync_mode == "firebase":
+            if time.time() - self._fb_last_ok >= 3:
+                return False, "RECONNECTING…", C["yellow"]          # can't reach Firebase
+            if time.time() - self._fb_presence_at < 8:
+                return True, "LIVE SYNCING", C["primary"]            # phone is on the line
+            return False, "CONNECTED", C["on_sv"]                    # FB ok, no phone yet
+        if self._sync_mode == "local":
+            if self._ws_clients:
+                return True, "LIVE SYNCING", C["primary"]
+            return False, "WAITING FOR DEVICE", C["muted"]
+        return False, "OFFLINE", C["muted"]
+
     def _pulse_live(self):
         if not self._sync_mode:
             return
+        live, label, color = self._sync_health()
         self._live_state = not self._live_state
-        self._live_dot.config(fg=C["primary"] if self._live_state else C["bar"])
-        self.root.after(900, self._pulse_live)
+        # Pulse the dot only when a peer is live; otherwise hold it steady in `color`.
+        dot_lit = self._live_state if live else True
+        self._live_dot.config(fg=color if dot_lit else C["bar"])
+        self._live_label.config(text=label, fg=color)
+        self.root.after(700, self._pulse_live)
 
     # ── MEETING TIMER ────────────────────────────────────────────────────────
 
@@ -891,6 +987,17 @@ class OverlayApp:
     def _normalize_word(w):
         return re.sub(r'[^a-z0-9]', '', w.lower())
 
+    def _on_speed_change(self, val):
+        self._autoscroll_wpm = max(40, int(float(val)))
+        if hasattr(self, "_speed_label"):
+            self._speed_label.config(text=str(self._autoscroll_wpm))
+        # Apply the new pace immediately instead of waiting out the current step.
+        if self._autoscroll_active:
+            if self._autoscroll_after:
+                self.root.after_cancel(self._autoscroll_after)
+            interval = int(2 * 60000 / max(40, self._autoscroll_wpm))
+            self._autoscroll_after = self.root.after(interval, self._autoscroll_step)
+
     def _toggle_autoscroll(self):
         self._autoscroll_active = not self._autoscroll_active
         if self._autoscroll_active:
@@ -898,47 +1005,52 @@ class OverlayApp:
                 self._stop_voice()           # auto + voice are mutually exclusive
             self._auto_btn.config(text="⏸  STOP", bg=C["primary"], fg=C["bg"])
             self._autoscroll_word_idx = 0
-            self._autoscroll_tick     = 0
             self._autoscroll_step()
         else:
             self._auto_btn.config(text="▶  AUTO", bg=C["on_s"], fg=C["bg"])
+            if self._autoscroll_after:
+                self.root.after_cancel(self._autoscroll_after)
+                self._autoscroll_after = None
             self.text.config(state="normal")
             self.text.tag_remove("autoscroll_hl", "1.0", "end")
             self.text.config(state="disabled")
 
     def _autoscroll_step(self):
+        # Highlight-driven teleprompter: advance two words at a time and let the
+        # viewport follow the highlight, paced by the speed slider (words/min).
+        self._autoscroll_after = None
         if not self._autoscroll_active:
             return
-        self._autoscroll_tick += 1
-
-        # scroll 1 line every 3 ticks → ~1 line per 240 ms (comfortable teleprompter pace)
-        if self._autoscroll_tick % 3 == 0:
-            self.text.yview_scroll(1, "units")
-
-        # advance word highlight every 5 ticks → ~1 word per 400 ms ≈ 150 wpm
-        if self._autoscroll_tick % 5 == 0:
-            words = self._autoscroll_words
-            idx   = self._autoscroll_word_idx
-            if words and idx < len(words):
-                self._highlight_word(idx, scroll=False)
-                self._autoscroll_word_idx += 1
-            elif idx >= len(words):
-                self._toggle_autoscroll()
-                return
-
-        self.root.after(80, self._autoscroll_step)
-
-    def _highlight_word(self, p, scroll=True):
-        """Move the active-word highlight to word index p (shared by auto + voice)."""
-        if not (0 <= p < len(self._autoscroll_words)):
+        words = self._autoscroll_words
+        idx   = self._autoscroll_word_idx
+        n     = len(words)
+        if not words or idx >= n:
+            self._toggle_autoscroll()        # reached the end of the slide
             return
-        a, b = self._autoscroll_words[p]
+        span = min(2, n - idx)               # two words per step
+        self._highlight_span(idx, span)
+        self._autoscroll_word_idx = idx + span
+        interval = int(span * 60000 / max(40, self._autoscroll_wpm))
+        self._autoscroll_after = self.root.after(interval, self._autoscroll_step)
+
+    def _highlight_span(self, start, count=1, scroll=True):
+        """Highlight `count` words starting at index `start`; viewport follows it."""
+        words = self._autoscroll_words
+        if not words:
+            return
+        start = max(0, min(start, len(words) - 1))
+        end   = min(len(words), start + max(1, count))
         self.text.config(state="normal")
         self.text.tag_remove("autoscroll_hl", "1.0", "end")
-        self.text.tag_add("autoscroll_hl", a, b)
+        self.text.tag_add("autoscroll_hl", words[start][0], words[end - 1][1])
         self.text.config(state="disabled")
         if scroll:
-            self.text.see(a)
+            self.text.see(words[end - 1][0])
+            self.text.see(words[start][0])
+
+    def _highlight_word(self, p, scroll=True):
+        """Single-word highlight (voice sync + click-to-seek)."""
+        self._highlight_span(p, 1, scroll)
 
     # ── VOICE SYNC (Vosk) ────────────────────────────────────────────────────
 
@@ -1044,7 +1156,11 @@ class OverlayApp:
                 self.root.after(0, lambda x=nw: self._voice_advance(x))
 
     def _voice_advance(self, spoken):
-        """Runs on the main thread — match a spoken word forward, move highlight."""
+        """Runs on the main thread — match a spoken word forward, move highlight.
+
+        Conservative on purpose: a short lookahead and tight rules keep the
+        highlight from leaping to a random later occurrence of a common word.
+        """
         if not self._voice_active:
             return
         words = self._word_texts
@@ -1052,17 +1168,21 @@ class OverlayApp:
         n     = len(words)
         if idx >= n:
             return
-        end   = min(n, idx + 15)            # 15-word lookahead
+        LOOK  = 8                            # small lookahead → no far jumps
+        end   = min(n, idx + LOOK)
+        near  = idx + 2                      # "very close" cutoff for short words
         match = -1
         for p in range(idx, end):           # exact match first
             if words[p] == spoken:
+                if len(spoken) <= 2 and p >= near:
+                    continue                 # don't let "the/a/of/in" leap ahead
                 match = p
                 break
-        if match < 0 and len(spoken) >= 4:  # then fuzzy (skip very short words)
-            for p in range(idx, end):
+        if match < 0 and len(spoken) >= 5:  # fuzzy: long words only, tight & near
+            for p in range(idx, min(n, idx + 5)):
                 wt = words[p]
-                if wt and abs(len(wt) - len(spoken)) <= 2 and \
-                   self._lev(wt, spoken) <= 2:
+                if wt and abs(len(wt) - len(spoken)) <= 1 and \
+                   self._lev(wt, spoken) <= 1:
                     match = p
                     break
         if match >= 0:

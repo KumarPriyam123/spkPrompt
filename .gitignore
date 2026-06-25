@@ -24,3 +24,7 @@ claude.md
 # Secrets / local config
 *.env
 .env*
+
+# Vosk voice-sync model (~40 MB, downloaded separately)
+vosk-model*/
+model/
