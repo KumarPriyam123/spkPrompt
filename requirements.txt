@@ -3,3 +3,14 @@ websockets>=11,<17
 # voice sync (optional — only needed for the 🎤 SYNC feature)
 vosk>=0.3.45
 sounddevice>=0.4.6
+# AI copilot (optional — only needed for the ✦ COPILOT feature)
+# WASAPI loopback capture, live STT (faster-whisper via RealtimeSTT), global hotkey.
+# The local LLM runs in Ollama (installed separately: https://ollama.com).
+pyaudiowpatch>=0.2.12
+RealtimeSTT>=1.0.2
+faster-whisper>=1.1          # transcription backend (CTranslate2); not pulled by RealtimeSTT 1.x
+silero-vad>=5                # VAD model for RealtimeSTT 1.x (else it hangs on a torch-hub download)
+numpy>=1.24                  # audio downmix in copilot/capture.py (direct import)
+keyboard>=0.13.5
+# GPU (optional, big speedup): install a CUDA torch build for your card and the
+# CTranslate2 CUDA runtime; the copilot auto-falls back to CPU otherwise.

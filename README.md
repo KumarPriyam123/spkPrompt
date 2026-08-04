@@ -68,6 +68,24 @@ No admin. No elevated privileges. No side effects on the rest of the system.
 
 ---
 
+## AI Copilot mode (100% on-device)
+
+A built-in live interview copilot — like Parakeet, but nothing leaves your machine. Click the **✦ COPILOT** sidebar tab to arm it. It listens to the *other side's* audio (the call output, not your mic), transcribes it locally, and when you press **F9** it streams an AI-generated answer straight into the same cloaked card — invisible to the screen share.
+
+- **Fully local** — system audio is captured via WASAPI loopback, transcribed on-device with faster-whisper, and answered by a local LLM running in [Ollama](https://ollama.com). The transcript and the answer never touch the network.
+- **Manual trigger** — you decide when to answer (F9); nothing is sent automatically.
+- **Your voice** — drop a short résumé summary in `copilot_profile.md` (git-ignored) and answers come back in first person, grounded in your background.
+
+**Setup:** install [Ollama](https://ollama.com) and `ollama pull qwen3:8b`, then `pip install -r requirements.txt` (first run downloads the Whisper model). See `CLAUDE.md` for env overrides and GPU notes.
+
+### Privacy & security notes
+
+- **On-device guarantee:** the copilot only ever talks to `http://localhost:11434` (Ollama). No audio, transcript, or answer is uploaded anywhere. Model weights are downloaded once from Hugging Face and then run offline.
+- **While copilot mode is active**, two system-level things happen, and stop the moment you leave the tab or close the app: (1) a **global F9 hotkey** is registered so the trigger works even when the meeting window is focused, and (2) **system output audio is captured** (loopback). Both are torn down on exit.
+- The existing **Firebase / Local-WebSocket sync** (for notes) does send your *notes* off-machine by design — that is separate from the copilot, which is never routed into those sync paths. The Local WebSocket server is unauthenticated and LAN-exposed; use it on trusted networks.
+
+---
+
 ## Web UI (phone_ui/index.html)
 
 A single HTML file — no build step, no framework. Open it directly in your phone browser or deploy it to GitHub Pages / Vercel.
@@ -179,10 +197,16 @@ Regular paragraph text. **Bold inline.**
 
 ```
 overlay.py              # Main application — OverlayApp class
+copilot/                # Local, on-device AI copilot (capture, transcribe, LLM)
+  capture.py            # WASAPI loopback audio capture
+  transcriber.py        # faster-whisper STT (RealtimeSTT + Silero VAD)
+  llm.py                # Ollama streaming client (local LLM)
+  engine.py             # Orchestrator: audio -> STT -> buffer -> F9 -> answer
 phone_ui/
   index.html            # Web UI for phone (no build step)
 sample_notes.txt        # Example notes file
-requirements.txt        # requests, websockets
+requirements.txt        # requests, websockets, + copilot deps
+copilot_profile.example.md  # Template for your private résumé summary
 .env.example            # Config template — copy to .env
 ```
 
@@ -193,7 +217,8 @@ requirements.txt        # requests, websockets
 | Key | Action |
 |-----|--------|
 | `←` / `→` | Previous / next slide |
-| `Escape` | Close settings popup / slide switcher / exit |
+| `F9` | Copilot: answer the latest transcribed question (global while copilot mode is on) |
+| `Escape` | Close settings popup / slide switcher / stop copilot / exit |
 
 ---
 

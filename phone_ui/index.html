@@ -587,6 +587,87 @@ main {
   font-size: 11px; color: var(--text-3); line-height: 1.5;
 }
 
+/* ── REMOTE CONTROL BAR ────────────────────────────────────────────────────── */
+.remote-bar {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 300;
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-top: 1px solid var(--outline);
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  display: none; flex-direction: column; gap: 10px;
+}
+.remote-bar.visible { display: flex; }
+
+.rc-row {
+  display: flex; align-items: center; gap: 8px;
+  justify-content: center;
+}
+
+.rc-btn {
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  background: var(--surface-3); border-radius: var(--r-md);
+  color: var(--text-1); font-family: var(--label);
+  font-size: 13px; font-weight: 700; letter-spacing: .03em;
+  padding: 10px 14px; min-width: 48px; min-height: 44px;
+  transition: background .12s, transform .08s, color .12s;
+  user-select: none; -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.rc-btn:active { transform: scale(.92); background: var(--surface-4); }
+.rc-btn.primary { background: var(--primary-btn); color: #fff; }
+.rc-btn.primary:active { background: var(--primary-btn-h); }
+
+.rc-nav { flex: 1; }
+
+.rc-sep { width: 1px; height: 28px; background: var(--outline); flex-shrink: 0; }
+
+.rc-slider-group {
+  display: flex; align-items: center; gap: 8px; flex: 1;
+}
+.rc-slider-group .slider-lbl {
+  font-family: var(--label); font-size: 8.5px; font-weight: 700;
+  letter-spacing: .12em; color: var(--text-3); white-space: nowrap;
+}
+.rc-slider {
+  -webkit-appearance: none; appearance: none;
+  flex: 1; height: 4px;
+  background: linear-gradient(to right, var(--primary) 0%, var(--primary) var(--pct, 50%), var(--outline) var(--pct, 50%));
+  border-radius: 2px; outline: none;
+}
+.rc-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--primary); cursor: grab;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.rc-slider::-moz-range-thumb {
+  width: 20px; height: 20px; border-radius: 50%; border: none;
+  background: var(--primary);
+}
+.rc-slider-val {
+  font-family: var(--label); font-size: 11px; font-weight: 700;
+  color: var(--text-2); min-width: 3.5ch; text-align: right;
+}
+
+.rc-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 8px; margin-bottom: 2px;
+  border-bottom: 1px solid var(--outline);
+}
+.rc-header-left { display: flex; align-items: center; gap: 8px; }
+.rc-icon {
+  width: 24px; height: 24px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border-radius: var(--r-sm); display: grid; place-items: center; font-size: 12px;
+}
+.rc-title {
+  font-family: var(--serif); font-size: 14px; font-weight: 600; color: var(--text-1);
+}
+
+/* when remote bar is visible, give main bottom padding so content isn't hidden */
+body:has(.remote-bar.visible) main { padding-bottom: 140px; }
+
 /* ── RESPONSIVE ──────────────────────────────────────────────────────────────── */
 @media (max-width: 640px) {
   header { padding: 0 12px; gap: 8px; }
@@ -598,6 +679,7 @@ main {
   .editor-col > * { padding: 16px; font-size: 15px; }
   .notes-footer { padding-left: 56px; }
   .tool-btn::after { display: none; }
+  .rc-btn { padding: 10px 10px; font-size: 12px; }
 }
   </style>
 </head>
@@ -740,6 +822,41 @@ main {
 
 </main>
 
+<!-- ══ REMOTE CONTROL BAR ═══════════════════════════════════════════════════ -->
+<div class="remote-bar" id="remote-bar">
+  <div class="rc-header">
+    <div class="rc-header-left">
+      <div class="rc-icon">🎛</div>
+      <span class="rc-title">Control Panel</span>
+    </div>
+    <button class="help-btn" id="rc-help-btn" title="What is this?">?</button>
+  </div>
+  <div class="rc-row">
+    <button class="rc-btn rc-nav" onclick="sendCmd({cmd:'navigate',delta:-1})">◀ Prev</button>
+    <button class="rc-btn rc-nav primary" onclick="sendCmd({cmd:'navigate',delta:1})">Next ▶</button>
+    <div class="rc-sep"></div>
+    <button class="rc-btn" onclick="sendCmd({cmd:'font',delta:-1})">A−</button>
+    <button class="rc-btn" onclick="sendCmd({cmd:'font',delta:1})">A+</button>
+  </div>
+  <div class="rc-row">
+    <div class="rc-slider-group">
+      <span class="slider-lbl">SCROLL</span>
+      <input type="range" class="rc-slider" id="rc-scroll"
+             min="0" max="100" value="0"
+             oninput="onScrollSlider(this)" />
+    </div>
+  </div>
+  <div class="rc-row">
+    <div class="rc-slider-group">
+      <span class="slider-lbl">OPACITY</span>
+      <input type="range" class="rc-slider" id="rc-opacity"
+             min="20" max="100" value="93"
+             oninput="onOpacitySlider(this)" />
+      <span class="rc-slider-val" id="rc-opacity-val">93%</span>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── STATE ─────────────────────────────────────────────────────────────────────
 let slides = [""], currentSlide = 0, mode = "firebase";
@@ -831,6 +948,7 @@ function setMode(m) {
   setBtnState(document.getElementById("fb-connect-btn"),"idle");
   setBtnState(document.getElementById("ws-connect-btn"),"idle");
   if (m==="local") { disconnectWS(); stopFbPoll(); stopPresence(); }
+  hideRemoteBar();
   localStorage.setItem("overlay-mode", m);
 }
 
@@ -988,6 +1106,7 @@ async function fbConnect(){
     localStorage.setItem("overlay-fb-url",url);
     startFbPoll();
     startPresence();
+    showRemoteBar();
     setTimeout(collapseTop, 900);
   } catch { setStatus("error","FAILED"); setBtnState(btn,"failed"); }
 }
@@ -1048,8 +1167,8 @@ function connectWS(){
   setStatus("","CONNECTING…"); setBtnState(btn,"connecting");
   try{
     ws=new WebSocket(`ws://${addr}`);
-    ws.onopen   =()=>{ setStatus("connected"); setBtnState(btn,"connected"); setTimeout(collapseTop,900); };
-    ws.onclose  =()=>{ setStatus("","DISCONNECTED"); setBtnState(btn,"idle"); ws=null; };
+    ws.onopen   =()=>{ setStatus("connected"); setBtnState(btn,"connected"); showRemoteBar(); setTimeout(collapseTop,900); };
+    ws.onclose  =()=>{ setStatus("","DISCONNECTED"); setBtnState(btn,"idle"); ws=null; hideRemoteBar(); };
     ws.onerror  =()=>{ setStatus("error","FAILED"); setBtnState(btn,"failed"); };
     ws.onmessage=ev=>{ if(ev.data!==slides.join("\n---\n")) loadContent(ev.data); };
   } catch { setStatus("error","FAILED"); setBtnState(btn,"failed"); }
@@ -1089,7 +1208,19 @@ const POPOVER_CONTENT = {
         <div class="step-txt">Paste the URL above and click <b>Establish Connection</b>.</div>
       </div>
     </div>
-    <div class="pop-note">Test mode rules expire after 30 days. Renew in Firebase → Rules if the connection stops working.</div>`
+    <div class="pop-note">Test mode rules expire after 30 days. Renew in Firebase → Rules if the connection stops working.</div>`,
+  "rc-pop": `
+    <div class="popover-title">CONTROL PANEL</div>
+    <p style="font-size:12px;color:var(--text-2);line-height:1.6;margin-bottom:10px">
+      Remotely control the overlay on your laptop — no mouse needed on the presenter screen.
+    </p>
+    <ul class="pop-list">
+      <li><span class="chip">◀ ▶</span> Navigate between slides</li>
+      <li><span class="chip">▲ ▼</span> Scroll within the current slide</li>
+      <li><span class="chip">A− A+</span> Adjust font size on the overlay</li>
+      <li><span class="chip gold">OPACITY</span> Control overlay transparency</li>
+    </ul>
+    <div class="pop-note">Commands are sent over the active connection (Firebase or Local). The overlay must be connected for controls to work.</div>`
 };
 
 function togglePopover(btnEl, id) {
@@ -1107,11 +1238,15 @@ function togglePopover(btnEl, id) {
   pop.className = "popover";
   pop.innerHTML = POPOVER_CONTENT[id] || "";
 
-  // Set each property individually — don't rely on cssText
   pop.style.position = "fixed";
   pop.style.zIndex   = "600";
-  pop.style.top      = (rect.bottom + 8) + "px";
   pop.style.right    = Math.max(8, window.innerWidth - rect.right) + "px";
+  // open upward if the button is in the bottom third of the viewport
+  if (rect.top > window.innerHeight * 0.66) {
+    pop.style.bottom = (window.innerHeight - rect.top + 8) + "px";
+  } else {
+    pop.style.top = (rect.bottom + 8) + "px";
+  }
 
   document.body.appendChild(pop);
 
@@ -1137,6 +1272,52 @@ document.getElementById("conn-help-btn").addEventListener("click", function(e) {
   e.stopPropagation();
   togglePopover(this, "conn-pop");
 });
+document.getElementById("rc-help-btn").addEventListener("click", function(e) {
+  e.stopPropagation();
+  togglePopover(this, "rc-pop");
+});
+
+// ── REMOTE CONTROL ───────────────────────────────────────────────────────────
+const remoteBar    = document.getElementById("remote-bar");
+const rcOpacity    = document.getElementById("rc-opacity");
+const rcOpacityVal = document.getElementById("rc-opacity-val");
+
+function sendCmd(cmd) {
+  cmd.ts = Date.now();
+  const json = JSON.stringify(cmd);
+  if (mode === "local" && ws?.readyState === WebSocket.OPEN) {
+    ws.send(json);
+  } else if (mode === "firebase" && getDbUrl()) {
+    fetch(`${getDbUrl()}/overlay/command.json`, {
+      method: "PUT", headers: {"Content-Type": "application/json"}, body: json
+    }).catch(() => {});
+  }
+}
+
+let scrollDebounce = null;
+function onScrollSlider(el) {
+  const frac = +el.value / 100;
+  const rel = (+el.value).toFixed(1);
+  el.style.setProperty("--pct", rel + "%");
+  clearTimeout(scrollDebounce);
+  scrollDebounce = setTimeout(() => sendCmd({cmd:"scroll_to", fraction: frac}), 30);
+}
+
+let opacityDebounce = null;
+function onOpacitySlider(el) {
+  const v = +el.value;
+  rcOpacityVal.textContent = v + "%";
+  const rel = ((v - 20) / 80 * 100).toFixed(1);
+  el.style.setProperty("--pct", rel + "%");
+  clearTimeout(opacityDebounce);
+  opacityDebounce = setTimeout(() => sendCmd({cmd:"opacity", value: v}), 60);
+}
+
+function showRemoteBar() { remoteBar.classList.add("visible"); }
+function hideRemoteBar() { remoteBar.classList.remove("visible"); }
+
+// init slider track fill
+(function(){ const rel = ((93 - 20) / 80 * 100).toFixed(1); rcOpacity.style.setProperty("--pct", rel + "%"); })();
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 const savedMode   = localStorage.getItem("overlay-mode")    || "firebase";

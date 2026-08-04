@@ -30,6 +30,10 @@ LABEL = "Public Sans"
 
 class OverlayApp:
 
+    # Default right-side hint in the copilot transcript pane (replaced by the live
+    # partial words while editing the pending question).
+    _COPILOT_TR_HINT = "click to edit  ·  Enter answer  ·  F10 new chat"
+
     def __init__(self, root):
         self.root      = root
         self.slides    = ["# Welcome\n\nOpen a file via ⚙  or connect to sync."]
@@ -46,6 +50,7 @@ class OverlayApp:
         self._fb_last_ok    = 0          # time of last successful Firebase poll (badge health)
         self._fb_presence_val = None     # last phone heartbeat value seen
         self._fb_presence_at  = 0        # local time that heartbeat last changed (peer-present)
+        self._last_cmd_ts     = 0        # timestamp of the last processed remote command
         self._editing       = False      # active-card edit mode flag
         self._live_after    = None       # debounce id for live edit broadcasts
         self._ws_clients    = set()      # connected local-WS clients
@@ -67,6 +72,29 @@ class OverlayApp:
         self._voice_active        = False
         self._voice_version       = 0    # increments to cancel old mic threads
         self._voice_spoken_count  = 0    # words consumed from the current partial
+
+        # ── AI copilot (local, on-device) ──
+        self._copilot           = None   # CopilotEngine instance (lazy)
+        self._copilot_active    = False
+        self._copilot_status    = "idle"
+        self._copilot_transcript = []    # rolling transcript snapshot (list[str])
+        self._copilot_question  = ""     # question currently being answered
+        self._copilot_answer    = ""     # accumulated streamed answer
+        self._copilot_hotkey    = False  # global F9 hook registered?
+        self._copilot_hotkey_handle = None  # handle from keyboard.add_hotkey
+        self._copilot_audio_rms = 0.0    # latest loopback RMS (audio-activity meter)
+        self._copilot_audio_at  = 0.0    # monotonic time of last audio frame
+        self._copilot_device    = ""     # captured device name (for diagnostics)
+        self._copilot_last_heard = ""    # most recent transcript snippet (liveness)
+        self._copilot_pane      = None   # live-transcript pane (built lazily)
+        self._copilot_tr_text   = None   # the transcript tk.Text inside the pane
+        self._copilot_tr_hint   = None   # right-side hint / live-words label in pane
+        self._copilot_lines     = []     # finalized transcript lines (pane display)
+        self._copilot_partial   = ""     # in-progress partial (live words)
+        self._copilot_answer_epoch = 0   # generation id (drops stale aborted tokens)
+        self._copilot_editing   = False  # editing the pending-question panel?
+        self._copilot_think_open  = False  # THINKING section started this answer?
+        self._copilot_answer_open = False  # ANSWER section started this answer?
 
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -98,6 +126,23 @@ class OverlayApp:
             print(f"WARNING: screen-capture cloaking failed "
                   f"(HWND={hwnd:#x}, error={err}). "
                   "The overlay may be visible in screen shares.")
+
+    def _quit(self):
+        """Tear down background workers (copilot engine + global F9 hook + STT
+        child processes) before destroying the window, so nothing is orphaned."""
+        if getattr(self, "_quitting", False):
+            return                       # idempotent — ignore a second close event
+        self._quitting = True
+        try:
+            if self._copilot_active:
+                self._stop_copilot(set_notes_tab=False)
+        except Exception as e:           # noqa: BLE001 — never let cleanup block close
+            print(f"[Copilot] teardown error on quit: {type(e).__name__}: {e}")
+        finally:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass                     # already destroyed
 
     def _minimize(self):
         """Minimize via the overrideredirect toggle trick."""
@@ -132,7 +177,7 @@ class OverlayApp:
         left.bind("<B1-Motion>",     self._do_drag)
 
         for color, symbol, cmd in [
-            (C["red"],    "✕", self.root.destroy),
+            (C["red"],    "✕", self._quit),
             (C["yellow"], "−", self._minimize),
             (C["green"],  "●", lambda: None),
         ]:
@@ -227,8 +272,9 @@ class OverlayApp:
             for w in (wrap, icon_f, icon_l, name_l):
                 w.bind("<Button-1>", click)
 
-        make_tab("✏", "NOTES", "notes", self._show_notes)
-        make_tab("≡", "LOGS",  "logs",  self._toggle_logs_panel)
+        make_tab("✏", "NOTES",   "notes",   self._show_notes)
+        make_tab("≡", "LOGS",    "logs",    self._toggle_logs_panel)
+        make_tab("✦", "COPILOT", "copilot", self._toggle_copilot)
 
         hf = tk.Frame(sb, bg=C["bar"], cursor="hand2")
         hf.pack(side="bottom", pady=12)
@@ -236,6 +282,10 @@ class OverlayApp:
                  font=(LABEL, 12, "bold")).pack()
 
     def _set_active_tab(self, name):
+        # Leaving the copilot tab tears the pipeline down (without re-grabbing
+        # the tab we're in the middle of switching to).
+        if name != "copilot" and self._copilot_active:
+            self._stop_copilot(set_notes_tab=False)
         self._active_tab = name
         for n, (icon_f, icon_l, name_l) in self._tab_widgets.items():
             a = (n == name)
@@ -472,6 +522,9 @@ class OverlayApp:
             background="#1e2a40", underline=True)
         t.tag_configure("autoscroll_hl",
             background=C["primary"], foreground=C["bg"])
+        t.tag_configure("copilot_think",        # the model's live reasoning preview
+            font=(SERIF, fs - 1, "italic"), foreground=C["muted"],
+            lmargin1=12, lmargin2=12, rmargin=12, spacing1=1)
 
     # ── SLIDE RENDERING ──────────────────────────────────────────────────────
 
@@ -603,7 +656,7 @@ class OverlayApp:
         self.text.config(state="disabled")
 
     def navigate(self, delta):
-        if self._editing:
+        if self._editing or self._copilot_active:
             return
         new = self.current + delta
         if 0 <= new < len(self.slides):
@@ -628,6 +681,8 @@ class OverlayApp:
         """
         if self._editing:
             return              # already editing — let default caret placement run
+        if self._copilot_active:
+            return "break"      # copilot owns the card; no edit/seek
         if self._voice_active or self._autoscroll_active:
             return self._seek_word(event)
         self._enter_edit_mode(event)
@@ -748,12 +803,17 @@ class OverlayApp:
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not path or not os.path.exists(path):
             return
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig strips a BOM so a Notepad-saved file's first heading isn't
+        # prefixed with a stray ﻿ character.
+        with open(path, encoding="utf-8-sig") as f:
             content = f.read().replace('\r\n', '\n').replace('\r', '\n')
         parsed       = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
                         if s.strip()]
         self.slides  = parsed if parsed else ["# Empty file\n\nNo slides found."]
         self.current = 0
+        # Loading a deck while copilot owns the card: stash it but stay in copilot.
+        if self._copilot_active:
+            return
         self._stop_following()
         self.render_slide()
         self.root.focus_force()
@@ -832,7 +892,58 @@ class OverlayApp:
             return
         self.slides  = parsed
         self.current = min(self.current, len(parsed) - 1)
+        # Copilot owns the card while active — stash the updated deck but don't
+        # repaint over the streaming answer. The teleprompter is repainted by the
+        # render_slide() inside _stop_copilot when the user leaves copilot mode.
+        if self._copilot_active:
+            return
         self.render_slide()
+
+    # ── REMOTE COMMANDS (phone UI controls) ─────────────────────────────────
+
+    def _handle_remote_cmd(self, data):
+        if not isinstance(data, dict):
+            return
+        ts = data.get("ts", 0)
+        if not isinstance(ts, (int, float)):
+            return
+        if ts and ts <= self._last_cmd_ts:
+            return
+        self._last_cmd_ts = ts
+
+        cmd = data.get("cmd")
+        print(f"[RemoteCmd] {cmd} | {data}")
+        if cmd == "navigate":
+            delta = data.get("delta", 0)
+            if isinstance(delta, int) and delta:
+                self.navigate(delta)
+        elif cmd == "navigate_to":
+            idx = data.get("index", 0)
+            if isinstance(idx, int):
+                self.navigate_to(idx)
+        elif cmd == "scroll":
+            delta = data.get("delta", 0)
+            if isinstance(delta, (int, float)) and delta:
+                self._scroll_text(int(delta))
+        elif cmd == "scroll_to":
+            frac = data.get("fraction")
+            if isinstance(frac, (int, float)):
+                self.text.yview_moveto(max(0.0, min(1.0, float(frac))))
+        elif cmd == "opacity":
+            val = data.get("value")
+            if isinstance(val, (int, float)):
+                self._on_opacity(str(max(20, min(100, int(val)))))
+        elif cmd == "font":
+            delta = data.get("delta", 0)
+            if isinstance(delta, int) and delta:
+                self._change_font(delta)
+
+    def _scroll_text(self, delta):
+        units = max(1, min(50, abs(delta)))
+        if delta > 0:
+            self.text.yview_scroll(units, "units")
+        elif delta < 0:
+            self.text.yview_scroll(-units, "units")
 
     def start_firebase_sync(self, db_url):
         self._firebase_url  = db_url.rstrip("/")
@@ -873,6 +984,9 @@ class OverlayApp:
                     # mid-edit is retried (not silently dropped) once editing ends.
                     if isinstance(content, str) and content != self._last_synced:
                         self.root.after(0, lambda c=content: self._apply_remote_content(c))
+                    command = data.get("command") if isinstance(data, dict) else None
+                    if isinstance(command, dict) and "cmd" in command:
+                        self.root.after(0, lambda d=command: self._handle_remote_cmd(d))
             except Exception as e:
                 print(f"[Firebase] {type(e).__name__}: {e}")
                 time.sleep(2)
@@ -909,6 +1023,13 @@ class OverlayApp:
                         if len(msg) > MAX_MSG:
                             print(f"[WebSocket] message dropped: {len(msg):,} bytes exceeds limit")
                             continue
+                        try:
+                            data = json.loads(msg)
+                            if isinstance(data, dict) and "cmd" in data:
+                                self.root.after(0, lambda d=data: self._handle_remote_cmd(d))
+                                continue
+                        except (json.JSONDecodeError, ValueError):
+                            pass
                         self.root.after(0, lambda c=msg: self._apply_remote_content(c))
             finally:
                 self._ws_clients.discard(ws)
@@ -999,6 +1120,8 @@ class OverlayApp:
             self._autoscroll_after = self.root.after(interval, self._autoscroll_step)
 
     def _toggle_autoscroll(self):
+        if self._copilot_active:
+            return                           # copilot owns the card — mutually exclusive
         self._autoscroll_active = not self._autoscroll_active
         if self._autoscroll_active:
             if self._voice_active:
@@ -1055,6 +1178,8 @@ class OverlayApp:
     # ── VOICE SYNC (Vosk) ────────────────────────────────────────────────────
 
     def _toggle_voice(self):
+        if self._copilot_active:
+            return                           # copilot owns the card — mutually exclusive
         if self._voice_active:
             self._stop_voice()
         else:
@@ -1216,6 +1341,472 @@ class OverlayApp:
                 self._highlight_word(p)
                 break
         return "break"
+
+    # ── AI COPILOT (local, on-device) ────────────────────────────────────────
+    #
+    # A separate `copilot/` engine runs WASAPI loopback → faster-whisper → Qwen3
+    # (Ollama) and streams the answer back here. All engine callbacks fire on
+    # worker threads, so every one is marshalled onto the tk loop via root.after.
+
+    def _toggle_copilot(self):
+        if self._copilot_active:
+            self._stop_copilot()
+        else:
+            self._start_copilot()
+
+    def _start_copilot(self):
+        try:
+            from copilot import CopilotEngine
+        except Exception as e:                       # noqa: BLE001
+            print(f"[Copilot] engine import failed: {type(e).__name__}: {e}")
+            self._manuscript_lbl.config(
+                text="✦  COPILOT  ·  install deps: pip install -r requirements.txt")
+            return
+
+        # Copilot takes over the card — stop any teleprompter following / editing.
+        self._stop_following()
+        if self._editing:
+            self._commit_edit()
+        if self._logs_visible:
+            self._hide_logs()
+
+        self._copilot_active     = True
+        self._copilot_status     = "idle"
+        self._copilot_transcript = []
+        self._copilot_question   = ""
+        self._copilot_answer     = ""
+        self._copilot_answer_epoch = 0      # drop stray tokens from an aborted stream
+        self._copilot_editing    = False    # editing the pending-question panel?
+
+        def after(fn):
+            return lambda *a, **k: self.root.after(0, lambda: fn(*a, **k))
+
+        self._copilot_last_heard = ""
+        self._copilot_audio_at   = 0.0
+        self._copilot_lines      = []
+        self._copilot_partial    = ""
+        self._copilot = CopilotEngine(
+            on_status       =after(self._copilot_set_status),
+            on_transcript   =after(self._copilot_on_transcript),
+            on_utterance    =after(self._copilot_on_utterance),
+            on_partial      =after(self._copilot_on_partial),
+            on_answer_start =after(self._copilot_on_answer_start),
+            on_thinking     =after(self._copilot_on_thinking),
+            on_answer_token =after(self._copilot_on_answer_token),
+            on_answer_done  =after(self._copilot_on_answer_done),
+            on_error        =after(self._copilot_on_error),
+            on_audio        =after(self._copilot_on_audio))
+        self._copilot.start()
+        self._register_copilot_hotkey()
+        self._copilot_show_pane(True)
+        self._copilot_clear_transcript()
+        self._copilot_render()
+        # _hide_logs() above may have reset the active tab to NOTES — reclaim the
+        # COPILOT highlight (this won't re-tear-down: teardown is name != copilot).
+        self._set_active_tab("copilot")
+
+    def _stop_copilot(self, set_notes_tab=True):
+        if not self._copilot_active:
+            return
+        if self._copilot_editing:
+            self._copilot_exit_edit()        # restore the pane to a clean state
+        self._copilot_active = False
+        self._unregister_copilot_hotkey()
+        if self._copilot is not None:
+            self._copilot.stop()
+            self._copilot = None
+        self._copilot_show_pane(False)   # hide the live-transcript pane
+        if set_notes_tab:
+            self._set_active_tab("notes")
+        self.render_slide()        # always restore the teleprompter card (row 0)
+
+    # ── engine callbacks (already marshalled to the tk loop) ──────────────────
+    def _copilot_set_status(self, status):
+        if not self._copilot_active:
+            return
+        self._copilot_status = status
+        self._copilot_update_header()
+        # Keep the transcript-pane placeholder honest (loading vs listening vs
+        # error) until the first real speech arrives.
+        if not self._copilot_lines and not self._copilot_partial:
+            self._copilot_render_transcript()
+
+    def _copilot_on_transcript(self, buffer):
+        # Full rolling buffer (used by the engine for LLM context). The visible
+        # live transcript is appended incrementally in _copilot_on_utterance, and
+        # the answer streams into self.text on F9 — so nothing to repaint here.
+        if not self._copilot_active:
+            return
+        self._copilot_transcript = list(buffer)
+
+    def _copilot_on_answer_start(self, question, epoch=0):
+        if not self._copilot_active:
+            return
+        # New run owns the card now — record its epoch so late tokens from a
+        # superseded (aborted/re-rolled) stream are dropped below.
+        self._copilot_answer_epoch = epoch
+        self._copilot_question    = question
+        self._copilot_answer      = ""
+        self._copilot_think_open  = False
+        self._copilot_answer_open = False
+        # Hold the widget "normal" for the whole stream (re-disabled in _done) so
+        # tokens don't flip state on every chunk. The card has no caret
+        # (insertwidth=0) and clicks are swallowed by _on_text_click during
+        # copilot, so leaving it normal can't be edited by the user.
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", question.strip() + "\n", "h2")
+        self.text.insert("end", "\n")
+        self.text.see("1.0")        # show the top of the new answer; do NOT follow
+        self._copilot_update_header()
+
+    def _copilot_on_thinking(self, token, epoch=0):
+        """Live reasoning preview — stream it (dim/italic) so you can start framing
+        a reply before the polished answer is ready."""
+        if not self._copilot_active or epoch != self._copilot_answer_epoch:
+            return
+        if not self._copilot_think_open:
+            self.text.insert("end", "💭  THINKING…\n", "prompt_header")
+            self._copilot_think_open = True
+        self.text.insert("end", token, "copilot_think")
+        # No auto-scroll — the user controls the viewport while it streams.
+
+    def _copilot_on_answer_token(self, token, epoch=0):
+        if not self._copilot_active or epoch != self._copilot_answer_epoch:
+            return
+        # First answer token: if reasoning was shown above, label the answer so the
+        # two are visually separated; otherwise stream the answer straight in.
+        if not self._copilot_answer_open:
+            if self._copilot_think_open:
+                self.text.insert("end", "\n\n✦  ANSWER\n", "prompt_header")
+            self._copilot_answer_open = True
+        self._copilot_answer += token
+        self.text.insert("end", token, "body")
+        # No auto-scroll while generating — let the user scroll at their own pace.
+
+    def _copilot_on_answer_done(self, epoch=0):
+        if not self._copilot_active or epoch != self._copilot_answer_epoch:
+            return
+        self.text.config(state="disabled")     # re-lock after the streamed answer
+        self._copilot_update_header()
+
+    def _copilot_on_error(self, msg):
+        print(f"[Copilot] {msg}")
+        if self._copilot_active:
+            self._copilot_status = f"error — {msg}"
+            self._copilot_update_header()
+            if not self._copilot_lines and not self._copilot_partial:
+                self._copilot_render_transcript()
+
+    # ── trigger + rendering ───────────────────────────────────────────────────
+    def _copilot_trigger(self):
+        if not self._copilot_active or not self._copilot:
+            return
+        # While editing the question, Enter / Ctrl+Enter mean "commit + send" — not
+        # "trigger on the raw pending speech". (Plain Enter is already intercepted by
+        # the edit-box binding; this also covers the global Ctrl+Enter hotkey.)
+        if self._copilot_editing:
+            self._copilot_commit_edit()
+            return
+        self._copilot.trigger()
+
+    def _copilot_reset(self):
+        """F10 — start a fresh conversation: wipe the LLM memory and clear the
+        on-screen transcript + answer."""
+        if not self._copilot_active or not self._copilot:
+            return
+        if self._copilot_editing:
+            self._copilot_exit_edit()        # drop any in-progress question edit
+        self._copilot.reset_conversation()
+        self._copilot_lines    = []
+        self._copilot_partial  = ""
+        self._copilot_question = ""
+        self._copilot_answer   = ""
+        self._copilot_render_transcript()        # transcript pane → placeholder
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", "💬  NEW CONVERSATION\n", "prompt_header")
+        self.text.insert("end", "Memory cleared. Press Enter to answer the next "
+                                "question.", "body")
+        self.text.config(state="disabled")
+
+    def _copilot_on_audio(self, rms, device_name):
+        """Throttled (~3 Hz) audio-activity heartbeat from the capture layer."""
+        if not self._copilot_active:
+            return
+        self._copilot_audio_rms = rms
+        self._copilot_audio_at  = time.monotonic()
+        if device_name:
+            self._copilot_device = device_name
+        # Refresh the header only while idle/listening — never interrupt a stream.
+        if self._copilot_status in ("listening", "idle"):
+            self._copilot_update_header()
+
+    def _copilot_update_header(self):
+        # If the global hook failed (e.g. no admin), Enter only fires while the
+        # overlay is focused — tell the user instead of silently to stdout.
+        f9 = "Enter" if self._copilot_hotkey else "Enter (focus overlay)"
+        st = self._copilot_status
+        if self._copilot_editing:
+            label = "✦  COPILOT  ·  ✎ EDITING QUESTION  ·  Enter sends · Esc cancels"
+        elif st == "generating":
+            label = "✦  COPILOT  ·  ✦ GENERATING…"
+        elif st.startswith("loading") or st == "idle":
+            label = "✦  COPILOT  ·  ⏳ LOADING MODEL…"
+        elif st.startswith("error"):
+            label = f"✦  COPILOT  ·  ⚠ {st[8:]}"
+        elif st == "listening":
+            fresh   = (time.monotonic() - self._copilot_audio_at) < 0.6
+            hearing = fresh and self._copilot_audio_rms > 80   # quiet-room floor
+            if hearing:
+                label = f"✦  COPILOT  ·  🔊 HEARING…  ·  {f9} to answer"
+            elif self._copilot_audio_at:
+                label = f"✦  COPILOT  ·  ● LISTENING (silence)  ·  {f9}"
+            else:
+                label = f"✦  COPILOT  ·  ● LISTENING (no audio yet)  ·  {f9}"
+        else:
+            label = f"✦  COPILOT  ·  {st}"
+        self._manuscript_lbl.config(text=label)
+
+    def _build_copilot_pane(self):
+        """Live-transcript pane shown above the answer card during copilot mode.
+        Reuses row 0 of the viewport grid (where the prev card normally sits)."""
+        if self._copilot_pane is not None:
+            return
+        pane = tk.Frame(self._vp, bg=C["card_dim"])
+        hdr = tk.Frame(pane, bg=C["card_dim"])
+        hdr.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(hdr, text="◉  LIVE TRANSCRIPT", bg=C["card_dim"],
+                 fg=C["primary"], font=(LABEL, 7, "bold")).pack(side="left")
+        # Hint doubles as the live-words indicator while editing the question.
+        self._copilot_tr_hint = tk.Label(
+            hdr, text=self._COPILOT_TR_HINT, bg=C["card_dim"],
+            fg=C["muted"], font=(LABEL, 7))
+        self._copilot_tr_hint.pack(side="right")
+        txt = tk.Text(pane, height=6, bg=C["card_dim"], fg=C["on_sv"],
+                      relief="flat", bd=0, state="disabled", wrap="word",
+                      cursor="arrow", font=(SANS, max(8, self.font_size - 1)),
+                      padx=12, pady=(0), spacing3=3, insertwidth=0,
+                      highlightthickness=0)
+        txt.pack(fill="both", expand=True, padx=2, pady=(0, 8))
+        txt.tag_configure("tr_line", foreground=C["on_sv"])
+        txt.tag_configure("tr_new",  foreground=C["on_s"])
+        txt.tag_configure("tr_partial", foreground=C["primary"], font=(SANS,
+                          max(8, self.font_size - 1), "italic"))
+        # Click a word in the pending question to correct it before sending.
+        txt.bind("<Button-1>", self._copilot_tr_click)
+        self._copilot_pane    = pane
+        self._copilot_tr_text = txt
+
+    def _copilot_show_pane(self, show):
+        self._build_copilot_pane()
+        if show:
+            # Row 0 keeps weight 0 (its default) so the transcript stays a fixed
+            # ~6-line band and the answer card in row 1 (weight 1) takes the rest.
+            self._copilot_pane.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        else:
+            self._copilot_pane.grid_remove()
+
+    def _copilot_clear_transcript(self):
+        self._copilot_lines   = []
+        self._copilot_partial = ""
+        self._copilot_render_transcript()
+
+    def _copilot_set_placeholder(self):
+        self._copilot_render_transcript()
+
+    def _copilot_render_transcript(self):
+        """Render the transcript pane: finalized lines + the live partial line.
+        Falls back to a state-aware placeholder when nothing has been heard yet."""
+        txt = self._copilot_tr_text
+        if txt is None or self._copilot_editing:
+            return            # never repaint over an in-progress question edit
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        if not self._copilot_lines and not self._copilot_partial:
+            st = self._copilot_status
+            if st == "listening":
+                msg = "Listening… speech appears here as you speak."
+            elif st.startswith("error"):
+                msg = "⚠  " + st[8:]
+            else:
+                msg = ("⏳  Loading the speech model — first run downloads it, this "
+                       "can take a minute. Transcript starts once it's ready.")
+            txt.insert("end", msg + "\n", "tr_line")
+        else:
+            for ln in self._copilot_lines[-10:]:
+                txt.insert("end", "•  " + ln + "\n", "tr_new")
+            if self._copilot_partial:
+                txt.insert("end", "▶  " + self._copilot_partial + "…", "tr_partial")
+        txt.see("end")
+        txt.config(state="disabled")
+
+    def _copilot_on_utterance(self, text):
+        """A finalized sentence → commit it as a transcript line, clear the partial."""
+        if not self._copilot_active:
+            return
+        self._copilot_lines.append(text)
+        self._copilot_lines = self._copilot_lines[-30:]
+        self._copilot_partial = ""
+        if self._copilot_editing:
+            # Approach A: while you edit, new speech lands at the END of the edit
+            # buffer without disturbing your caret — so the tail stays editable too.
+            self._copilot_edit_append(text)
+        else:
+            self._copilot_render_transcript()
+
+    def _copilot_on_partial(self, text):
+        """Live partial words (updates many times/sec) → refresh the partial line."""
+        if not self._copilot_active or not text:
+            return
+        self._copilot_partial = text
+        if self._copilot_editing:
+            # Don't inject the volatile partial into the editable text — show it as a
+            # dim live indicator in the pane hint instead.
+            self._copilot_tr_set_hint(
+                "🔊 " + (text[:42] + "…" if len(text) > 42 else text))
+        else:
+            self._copilot_render_transcript()
+
+    # ── editable question panel (click a word → fix → Enter sends) ─────────────
+    def _copilot_tr_set_hint(self, text=None):
+        if self._copilot_tr_hint is not None:
+            self._copilot_tr_hint.config(
+                text=self._COPILOT_TR_HINT if text is None else text)
+
+    def _copilot_tr_click(self, event):
+        """Single click in the transcript pane → edit the pending question.
+        Only while listening/idle (never mid-answer), and only if there's a pending
+        question to send. A disabled tk.Text still delivers <Button-1>."""
+        if (not self._copilot_active or self._copilot_editing
+                or self._copilot is None
+                or self._copilot_status not in ("listening", "idle")):
+            return
+        lines = self._copilot.pending_lines()
+        if not lines:
+            return                       # nothing pending — nothing to edit/send
+        self._copilot_enter_edit(lines, event)
+        return "break"
+
+    def _copilot_enter_edit(self, lines, event):
+        self._copilot_editing = True
+        txt = self._copilot_tr_text
+        # insertbackground = caret colour; default is black → invisible on the dark
+        # pane, so force a bright near-white caret while editing.
+        txt.config(state="normal", insertwidth=2, cursor="xterm",
+                   insertbackground=C["on_s"])
+        txt.delete("1.0", "end")
+        txt.insert("end", "\n".join(lines))     # one utterance per line
+        try:                                     # caret near the click (tk clamps)
+            txt.mark_set("insert", txt.index(f"@{event.x},{event.y}"))
+        except tk.TclError:
+            txt.mark_set("insert", "end")
+        txt.focus_set()
+        txt.see("insert")
+        # Instance bindings fire before the class binding, so returning "break"
+        # both sends and suppresses the newline the Text would otherwise insert.
+        txt.bind("<Return>",   self._copilot_commit_edit)
+        txt.bind("<KP_Enter>", self._copilot_commit_edit)
+        txt.bind("<Escape>",   self._copilot_cancel_edit)
+        self._copilot_tr_set_hint("✎ editing — Enter sends · Esc cancels")
+        self._copilot_update_header()
+
+    def _copilot_edit_append(self, text):
+        """Append a finalized utterance to the end of the edit buffer, keeping the
+        user's caret and viewport put (Approach A)."""
+        txt = self._copilot_tr_text
+        saved   = txt.index("insert")
+        at_tail = txt.compare("insert", ">=", "end-1c")
+        txt.insert("end", "\n" + text)
+        txt.mark_set("insert", saved)            # don't let the append drag the caret
+        if at_tail:
+            self._copilot_tr_set_hint("▼ new speech added below")
+        else:
+            txt.see("insert")                    # stay where they're editing
+
+    def _copilot_commit_edit(self, event=None):
+        """Enter → send exactly what's in the box (collapsing it to one question),
+        clearing pending so mid-edit utterances aren't double-counted."""
+        if not self._copilot_editing:
+            return "break"
+        raw = self._copilot_tr_text.get("1.0", "end-1c")
+        question = " ".join(raw.split())
+        self._copilot_exit_edit()
+        if question and self._copilot is not None:
+            self._copilot.trigger_with(question)
+        return "break"
+
+    def _copilot_cancel_edit(self, event=None):
+        """Esc → discard the edit, restore the live transcript view."""
+        if not self._copilot_editing:
+            return "break"
+        self._copilot_exit_edit()
+        self._copilot_render_transcript()
+        return "break"
+
+    def _copilot_exit_edit(self):
+        self._copilot_editing = False
+        txt = self._copilot_tr_text
+        for seq in ("<Return>", "<KP_Enter>", "<Escape>"):
+            txt.unbind(seq)
+        txt.config(insertwidth=0, cursor="arrow", state="disabled")
+        self._copilot_tr_set_hint(None)
+        self.root.focus_set()            # hand Enter back to the global trigger
+        self._copilot_update_header()
+
+    def _copilot_render(self):
+        """Paint the copilot view into the active card (idle / transcript state)."""
+        self._prev_card.grid_remove()
+        self._next_card.grid_remove()
+        self._copilot_update_header()
+        # The live transcript lives in its own pane above; self.text is the ANSWER
+        # area. When no answer has streamed yet, show a short hint here.
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", "✦  ANSWER\n", "prompt_header")
+        if self._copilot_device:
+            self._insert_rich(
+                f"Capturing from: **{self._copilot_device}**", "body")
+        self.text.insert(
+            "end",
+            "\nWatch the live transcript above. When you hear a question, press  "
+            "Enter  — the answer streams in here, invisible to screen capture.",
+            "body")
+        self.text.config(state="disabled")
+
+    def _register_copilot_hotkey(self):
+        # When the overlay HAS focus: plain Enter = answer, F10 = new conversation.
+        self.root.bind("<Return>", lambda e: self._copilot_trigger())
+        self.root.bind("<F10>",    lambda e: self._copilot_reset())
+        # Global (overlay NOT focused, e.g. meeting window in front): use Ctrl+Enter
+        # so it can't misfire on every plain Enter you type elsewhere. (Fn is
+        # firmware-level and invisible to software, so Fn+Enter can't be hooked.)
+        self._copilot_hotkey_handle = None
+        try:
+            import keyboard
+            keyboard.add_hotkey("ctrl+enter", lambda: self.root.after(0, self._copilot_trigger))
+            keyboard.add_hotkey("f10",        lambda: self.root.after(0, self._copilot_reset))
+            self._copilot_hotkey = True
+        except Exception as e:                       # noqa: BLE001
+            self._copilot_hotkey = False
+            print(f"[Copilot] global Ctrl+Enter/F10 hotkeys unavailable "
+                  f"({type(e).__name__}: {e}). Plain Enter still works when the "
+                  f"overlay is focused.")
+
+    def _unregister_copilot_hotkey(self):
+        self.root.unbind("<Return>")
+        self.root.unbind("<F10>")
+        if self._copilot_hotkey:
+            # unhook_all() removes our f9 + f10 hotkeys AND tears down keyboard's
+            # global low-level hook + listener thread, so the global keyboard hook
+            # dies with copilot mode rather than only when the process exits.
+            try:
+                import keyboard
+                keyboard.unhook_all()
+            except Exception:                        # noqa: BLE001
+                pass
+            self._copilot_hotkey = False
+            self._copilot_hotkey_handle = None
 
     # ── SETTINGS POPUP ───────────────────────────────────────────────────────
 
@@ -1439,6 +2030,10 @@ class OverlayApp:
         self._prev_text.config(font=(SERIF, self.font_size - 2, "italic"))
         self._next_text.config(font=(SANS,  self.font_size - 2))
         self.text.config(font=(SANS, self.font_size))
+        # Copilot owns the card — the font/tags already updated live; don't repaint
+        # the slide over the streaming answer (same guard as _apply_remote_content).
+        if self._copilot_active:
+            return
         self.render_slide()
 
     # ── DRAG ─────────────────────────────────────────────────────────────────
@@ -1461,10 +2056,12 @@ class OverlayApp:
     def _handle_escape(self, event):
         if self._settings_win and self._settings_win.winfo_exists():
             self._settings_win.destroy()
+        elif self._copilot_active:
+            self._stop_copilot()
         elif self._logs_visible:
             self._hide_logs()
         else:
-            self.root.destroy()
+            self._quit()
 
 
 # ── .ENV LOADER ──────────────────────────────────────────────────────────────
@@ -1474,7 +2071,9 @@ def _load_dotenv():
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(env_path):
         return
-    with open(env_path) as f:
+    # utf-8-sig strips a BOM — Windows Notepad writes UTF-8 with BOM by default,
+    # which would otherwise glue ﻿ onto the first key and break the lookup.
+    with open(env_path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -1498,6 +2097,9 @@ def main():
     _load_dotenv()
     root = tk.Tk()
     app  = OverlayApp(root)
+    # Ensure copilot/STT child processes + global hotkey are torn down on any
+    # window-manager close, not just the in-app ✕ / Escape paths.
+    root.protocol("WM_DELETE_WINDOW", app._quit)
 
     args = sys.argv[1:]
 
@@ -1530,7 +2132,33 @@ def main():
             _print_local_ip(port)
 
     root.mainloop()
+    # mainloop returned -> the window is gone. _quit() already did best-effort
+    # teardown (engine.stop terminates the STT child, keyboard.unhook_all removes
+    # the global hook). But a surviving non-daemon RealtimeSTT child can still
+    # wedge multiprocessing's atexit join — leaving the PROCESS (and its audio
+    # capture) alive after the window closes, which is a privacy leak. Kill any
+    # child that's left, drop the keyboard hook, then force-exit so the process
+    # ALWAYS dies. Terminate BEFORE os._exit so the capture child isn't orphaned.
+    try:
+        import multiprocessing
+        for p in multiprocessing.active_children():
+            try:
+                p.terminate()
+            except Exception:            # noqa: BLE001
+                pass
+        for p in multiprocessing.active_children():
+            p.join(timeout=1.0)
+    except Exception:                    # noqa: BLE001
+        pass
+    try:
+        import keyboard
+        keyboard.unhook_all()
+    except Exception:                    # noqa: BLE001
+        pass
+    os._exit(0)                          # guarantee the red ✕ ends the script
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()   # safe under RealtimeSTT's spawn child procs
     main()

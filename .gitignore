@@ -28,3 +28,14 @@ claude.md
 # Vosk voice-sync model (~40 MB, downloaded separately)
 vosk-model*/
 model/
+
+# Copilot — private module, personal profile, and smoke tests
+copilot/
+copilot_profile.md
+copilot_profile.txt
+copilot_profile.example.md
+realtimesst.log
+
+# Personal resumes (private)
+*resume*.pdf
+*.pdf
