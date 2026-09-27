@@ -1077,90 +1077,141 @@ class OverlayApp:
             self.text.yview_scroll(-units, "units")
 
     def _take_screenshot_data_url(self):
-        import ctypes, ctypes.wintypes, base64, io
+        import base64, io
         from PIL import Image
 
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
+        im = None
+        # Primary method: PIL ImageGrab (DPI-aware, multi-monitor support on Windows)
+        try:
+            from PIL import ImageGrab
+            im = ImageGrab.grab(all_screens=True)
+        except Exception as e:
+            print(f"[Screenshot] ImageGrab failed ({e}), trying Win32 GDI...")
 
-        # Virtual screen metrics (covers multi-monitor or single)
-        vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
-        vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
-        vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
-        vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
-        if vw <= 0 or vh <= 0:
-            vw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-            vh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-            vx, vy = 0, 0
+        # Fallback method: Win32 GDI BitBlt
+        if im is None:
+            import ctypes, ctypes.wintypes
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
 
-        hdc = user32.GetDC(0)
-        memdc = gdi32.CreateCompatibleDC(hdc)
-        hbmp = gdi32.CreateCompatibleBitmap(hdc, vw, vh)
-        old_bmp = gdi32.SelectObject(memdc, hbmp)
+            vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+            vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+            if vw <= 0 or vh <= 0:
+                vw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+                vh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+                vx, vy = 0, 0
 
-        # SRCCOPY = 0x00CC0020, CAPTUREBLT = 0x40000000
-        gdi32.BitBlt(memdc, 0, 0, vw, vh, hdc, vx, vy, 0x00CC0020 | 0x40000000)
+            hdc = user32.GetDC(0)
+            memdc = gdi32.CreateCompatibleDC(hdc)
+            hbmp = gdi32.CreateCompatibleBitmap(hdc, vw, vh)
+            old_bmp = gdi32.SelectObject(memdc, hbmp)
 
-        class BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ('biSize', ctypes.wintypes.DWORD), ('biWidth', ctypes.wintypes.LONG),
-                ('biHeight', ctypes.wintypes.LONG), ('biPlanes', ctypes.wintypes.WORD),
-                ('biBitCount', ctypes.wintypes.WORD), ('biCompression', ctypes.wintypes.DWORD),
-                ('biSizeImage', ctypes.wintypes.DWORD), ('biXPelsPerMeter', ctypes.wintypes.LONG),
-                ('biYPelsPerMeter', ctypes.wintypes.LONG), ('biClrUsed', ctypes.wintypes.DWORD),
-                ('biClrImportant', ctypes.wintypes.DWORD)
-            ]
+            try:
+                gdi32.BitBlt(memdc, 0, 0, vw, vh, hdc, vx, vy, 0x00CC0020 | 0x40000000)
 
-        bmi = BITMAPINFOHEADER()
-        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.biWidth = vw
-        bmi.biHeight = -vh  # top-down DIB
-        bmi.biPlanes = 1
-        bmi.biBitCount = 32
-        bmi.biCompression = 0
+                class BITMAPINFOHEADER(ctypes.Structure):
+                    _fields_ = [
+                        ('biSize', ctypes.wintypes.DWORD), ('biWidth', ctypes.wintypes.LONG),
+                        ('biHeight', ctypes.wintypes.LONG), ('biPlanes', ctypes.wintypes.WORD),
+                        ('biBitCount', ctypes.wintypes.WORD), ('biCompression', ctypes.wintypes.DWORD),
+                        ('biSizeImage', ctypes.wintypes.DWORD), ('biXPelsPerMeter', ctypes.wintypes.LONG),
+                        ('biYPelsPerMeter', ctypes.wintypes.LONG), ('biClrUsed', ctypes.wintypes.DWORD),
+                        ('biClrImportant', ctypes.wintypes.DWORD)
+                    ]
 
-        buf = ctypes.create_string_buffer(vw * vh * 4)
-        gdi32.GetDIBits(memdc, hbmp, 0, vh, buf, ctypes.byref(bmi), 0)
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = vw
+                bmi.biHeight = -vh  # top-down DIB
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0
 
-        gdi32.SelectObject(memdc, old_bmp)
-        gdi32.DeleteObject(hbmp)
-        gdi32.DeleteDC(memdc)
-        user32.ReleaseDC(0, hdc)
+                buf = ctypes.create_string_buffer(vw * vh * 4)
+                gdi32.GetDIBits(memdc, hbmp, 0, vh, buf, ctypes.byref(bmi), 0)
+                im = Image.frombuffer('RGBA', (vw, vh), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+            finally:
+                gdi32.SelectObject(memdc, old_bmp)
+                gdi32.DeleteObject(hbmp)
+                gdi32.DeleteDC(memdc)
+                user32.ReleaseDC(0, hdc)
 
-        im = Image.frombuffer('RGBA', (vw, vh), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+        if im.mode != 'RGB':
+            im = im.convert('RGB')
 
         # Limit maximum dimension to 1920 to keep upload small (~50-150KB) for instant sync
         max_dim = 1920
-        if vw > max_dim or vh > max_dim:
-            ratio = min(max_dim / vw, max_dim / vh)
-            new_w = max(1, int(vw * ratio))
-            new_h = max(1, int(vh * ratio))
+        w, h = im.size
+        if w > max_dim or h > max_dim:
+            ratio = min(max_dim / w, max_dim / h)
+            new_w = max(1, int(w * ratio))
+            new_h = max(1, int(h * ratio))
             im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         bio = io.BytesIO()
         im.save(bio, format='JPEG', quality=85, optimize=True)
         b64 = base64.b64encode(bio.getvalue()).decode('ascii')
-        return f"data:image/jpeg;base64,{b64}"
+        return f"data:image/jpeg;base64,{b64}", im
 
-    def _capture_and_send_screenshot(self, req_id):
+    def _copy_image_to_system_clipboard(self, im):
         try:
+            import ctypes, io
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+            bio = io.BytesIO()
+            im.convert('RGB').save(bio, 'BMP')
+            data = bio.getvalue()[14:]  # BMP header is 14 bytes; rest is DIB
+            size = len(data)
+            hmem = kernel32.GlobalAlloc(0x0002, size)  # GMEM_MOVEABLE
+            if not hmem:
+                return False
+            ptr = kernel32.GlobalLock(hmem)
+            if not ptr:
+                kernel32.GlobalFree(hmem)
+                return False
+            ctypes.memmove(ptr, data, size)
+            kernel32.GlobalUnlock(hmem)
+            if not user32.OpenClipboard(0):
+                kernel32.GlobalFree(hmem)
+                return False
+            user32.EmptyClipboard()
+            user32.SetClipboardData(8, hmem)  # CF_DIB = 8
+            user32.CloseClipboard()
+            return True
+        except Exception as e:
+            print(f"[Screenshot] Local clipboard copy skipped: {e}")
+            return False
+
+    def _capture_and_send_screenshot(self, req_id=""):
+        try:
+            if not req_id:
+                req_id = f"shot_{int(time.time()*1000)}"
             print(f"[Screenshot] Capturing screen for req {req_id}...")
-            data_url = self._take_screenshot_data_url()
+            data_url, im = self._take_screenshot_data_url()
+            if im is not None:
+                self._copy_image_to_system_clipboard(im)
             payload = {
                 "req_id": req_id,
                 "ts": time.time(),
                 "image": data_url
             }
-            if self._sync_mode == "firebase" and self._firebase_url:
+            if (self._sync_mode == "firebase" or not self._sync_mode) and self._firebase_url:
                 import requests
                 r = requests.put(f"{self._firebase_url}/overlay/screenshot.json",
                                  data=json.dumps(payload), timeout=10)
                 print(f"[Screenshot] Pushed screenshot to Firebase (HTTP {r.status_code})")
-            elif self._sync_mode == "local":
-                if self._ws_loop and self._ws_clients:
-                    msg = json.dumps({"type": "screenshot", **payload})
-                    self._ws_loop.call_soon_threadsafe(self._ws_broadcast, msg)
-                    print(f"[Screenshot] Broadcasted screenshot to WS clients")
+            if self._sync_mode == "local" or (self._ws_loop and self._ws_clients):
+                msg = json.dumps({"type": "screenshot", **payload})
+                self._ws_loop.call_soon_threadsafe(self._ws_broadcast, msg)
+                print(f"[Screenshot] Broadcasted screenshot to WS clients")
         except Exception as e:
             print(f"[Screenshot] Error: {type(e).__name__}: {e}")
 
@@ -1168,6 +1219,7 @@ class OverlayApp:
         self._firebase_url  = db_url.rstrip("/")
         self._sync_version += 1
         self._sync_mode = "firebase"
+        self._last_cmd_ts = time.time() * 1000
         v = self._sync_version
         self.root.after(0, self._show_live_badge)
         threading.Thread(target=self._firebase_loop,
@@ -2271,6 +2323,13 @@ class OverlayApp:
         self.root.bind("<Left>",   lambda e: self.navigate(-1))
         self.root.bind("<Right>",  lambda e: self.navigate(1))
         self.root.bind("<Escape>", self._handle_escape)
+        self.root.bind("<Control-Shift-Q>", lambda e: self._on_screenshot_hotkey())
+        self.root.bind("<Control-Shift-q>", lambda e: self._on_screenshot_hotkey())
+
+    def _on_screenshot_hotkey(self):
+        req_id = f"local_{int(time.time()*1000)}"
+        threading.Thread(target=self._capture_and_send_screenshot,
+                         args=(req_id,), daemon=True).start()
 
     def _handle_escape(self, event):
         if self._settings_win and self._settings_win.winfo_exists():
@@ -2406,9 +2465,11 @@ def main():
         port = int(args[args.index("--port") + 1]) if "--port" in args else 8765
         app.start_local_ws_server(port)
         _print_local_ip(port)
-    elif args and not args[0].startswith("--"):
+
+    if args and not args[0].startswith("--"):
         app.load_file(args[0])
-    else:
+
+    if not app._sync_mode:
         # No CLI mode flag — auto-start from .env if values are present
         if os.environ.get("FIREBASE_URL"):
             print(f"Auto-connecting to Firebase from .env …")

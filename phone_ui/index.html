@@ -1714,6 +1714,15 @@ async function triggerScreenshot() {
 
   if (mode === "firebase") {
     pollForScreenshot(dbUrl, reqId);
+  } else if (mode === "local") {
+    clearTimeout(shotPollTimer);
+    shotPollTimer = setTimeout(() => {
+      if (isSnapping && currentShotReqId === reqId) {
+        isSnapping = false;
+        updateScreenshotBtnState("idle");
+        showToast("❌ Screenshot timed out (is overlay running?)", "error");
+      }
+    }, 12000);
   }
 }
 
@@ -1748,6 +1757,8 @@ function pollForScreenshot(dbUrl, reqId) {
 }
 
 async function onScreenshotReceived(payload) {
+  clearTimeout(shotPollTimer);
+  isSnapping = false;
   currentShotReqId = null;
   currentShotDataUrl = payload.image;
   updateScreenshotBtnState("success");
@@ -1770,6 +1781,10 @@ async function onScreenshotReceived(payload) {
 
 async function copyImageToClipboard(dataUrl) {
   return new Promise((resolve) => {
+    if (!navigator.clipboard || typeof navigator.clipboard.write !== "function" || typeof ClipboardItem === "undefined") {
+      resolve(false);
+      return;
+    }
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
