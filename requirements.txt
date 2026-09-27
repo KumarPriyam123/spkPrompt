@@ -1,5 +1,8 @@
 requests>=2.28,<3
 websockets>=11,<17
+# image notes — decode/scale photos embedded from the phone editor (JPEG/PNG/etc.)
+# Without it the overlay can only render PNG/GIF; phone photos are JPEG, so keep it.
+pillow>=10,<12
 # voice sync (optional — only needed for the 🎤 SYNC feature)
 vosk>=0.3.45
 sounddevice>=0.4.6

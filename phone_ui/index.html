@@ -517,6 +517,9 @@ main {
 .hl-prompt { color: var(--hl-prompt); font-style: italic; }
 .hl-bold   { color: var(--hl-bold);   font-weight: 700; }
 .hl-body   { color: var(--hl-body); }
+/* embedded-image lines carry a long base64 blob — dim it so it doesn't shout.
+   Same characters as the textarea, so caret/selection alignment is preserved. */
+.hl-img    { color: color-mix(in srgb, var(--hl-body) 32%, transparent); }
 
 /* ── NOTES FOOTER ────────────────────────────────────────────────────────────── */
 .notes-footer {
@@ -798,7 +801,11 @@ body:has(.remote-bar.visible) main { padding-bottom: 140px; }
         <div class="tool-sep"></div>
         <button class="tool-btn" onclick="insertBullet()"   data-tip="BULLET">≡</button>
         <button class="tool-btn" onclick="insertPrompt()"   data-tip="PROMPT" style="font-size:15px">›</button>
+        <div class="tool-sep"></div>
+        <button class="tool-btn" onclick="pickImage()"      data-tip="IMAGE">🖼</button>
       </div>
+      <input type="file" id="img-input" accept="image/*" style="display:none"
+             onchange="if(this.files[0])handleImageFile(this.files[0]); this.value='';">
 
       <div class="editor-outer">
         <div class="editor-col" id="editor-col">
@@ -1009,6 +1016,7 @@ function highlightLine(r) {
   const e=esc(r);
   if(/^# /.test(r))    return `<span class="hl-h1">${e}</span>`;
   if(/^## /.test(r))   return `<span class="hl-h2">${e}</span>`;
+  if(/^!\[[^\]]*\]\(/.test(r)) return `<span class="hl-img">${e}</span>`;
   if(/^[-*] /.test(r)) return `<span class="hl-bullet">${e}</span>`;
   if(/^> /.test(r))    return `<span class="hl-prompt">${e}</span>`;
   const b=e.replace(/\*\*(.+?)\*\*/g,'<span class="hl-bold">**$1**</span>');
@@ -1039,10 +1047,20 @@ function nodeToMd(node) {
     case"p":  return kids.trim()?kids.trim()+"\n\n":"";
     case"div":return kids.trim()?kids.trim()+"\n":"";
     case"br": return"\n";
+    // embed only already-inlined images (data: URLs); skip remote/broken srcs
+    case"img": return (node.src||"").startsWith("data:") ? `\n![image](${node.src})\n` : "";
     default:  return kids;
   }
 }
 editor.addEventListener("paste",e=>{
+  // Pasted bitmap (screenshot / copied photo) → embed it as an image
+  const items=(e.clipboardData&&e.clipboardData.items)||[];
+  for(const it of items){
+    if(it.type&&it.type.startsWith("image/")){
+      const file=it.getAsFile();
+      if(file){ e.preventDefault(); handleImageFile(file); return; }
+    }
+  }
   const html=e.clipboardData.getData("text/html"); if(!html) return;
   e.preventDefault();
   const div=document.createElement("div"); div.innerHTML=html;
@@ -1076,6 +1094,54 @@ function insertBold() {
 function insertHeading(n) { insertAtLineStart("#".repeat(n)+" "); }
 function insertBullet()   { insertAtLineStart("- "); }
 function insertPrompt()   { insertAtLineStart("> "); }
+
+// ── IMAGES ──────────────────────────────────────────────────────────────────
+// Photos are embedded straight into the note text as a downscaled data-URL
+// image (![image](data:...)). That way they ride the existing Firebase / local
+// sync channel — no extra upload endpoint — and render in the desktop overlay.
+const IMG_MAX_W = 1000;   // downscale wider images to this before embedding
+const IMG_QUALITY = 0.82; // JPEG quality for the embedded copy
+
+function pickImage(){ document.getElementById("img-input").click(); }
+
+// Draw onto a canvas at a capped width and return a compact data URL.
+function compressImage(img){
+  const scale = Math.min(1, IMG_MAX_W / img.naturalWidth);
+  const w = Math.max(1, Math.round(img.naturalWidth  * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  cv.getContext("2d").drawImage(img, 0, 0, w, h);
+  return cv.toDataURL("image/jpeg", IMG_QUALITY);
+}
+
+function insertImageData(dataUrl){
+  const s = editor.selectionStart, val = editor.value;
+  const before = val.slice(0, s), after = val.slice(s);
+  // keep the image on its own line for clean rendering in the overlay
+  const lead = (before === "" || before.endsWith("\n")) ? "" : "\n";
+  const md   = lead + "![image](" + dataUrl + ")\n";
+  editor.value = before + md + after;
+  const caret = (before + md).length;
+  editor.selectionStart = editor.selectionEnd = caret;
+  saveCurrentSlide(); updateAll(); scheduleSync(); editor.focus();
+}
+
+function handleImageFile(file){
+  if(!file || !file.type || !file.type.startsWith("image/")){
+    alert("That doesn't look like an image file."); return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload  = () => { try { insertImageData(compressImage(img)); }
+                          catch(err){ alert("Could not process that image."); } };
+    img.onerror = () => alert("Could not read that image.");
+    img.src = reader.result;
+  };
+  reader.onerror = () => alert("Could not read that file.");
+  reader.readAsDataURL(file);
+}
 
 editor.addEventListener("input",()=>{ lastTypedAt=Date.now(); saveCurrentSlide(); updateAll(); scheduleSync(); });
 

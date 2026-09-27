@@ -39,3 +39,12 @@ realtimesst.log
 # Personal resumes (private)
 *resume*.pdf
 *.pdf
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec
+*.exe
+
+# Session scratch / helper scripts (not part of the project)
+_*
+New Text Document.txt

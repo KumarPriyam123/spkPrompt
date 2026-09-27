@@ -4,6 +4,16 @@ import ctypes, re, sys, os, threading, json, time, asyncio
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
+
+def _app_dir():
+    """Directory to treat as 'next to overlay.py' — the real folder holding
+    the .exe when frozen by PyInstaller (onefile extracts __file__ into a
+    throwaway _MEIPASS temp dir, which is NOT where .env / vosk models live),
+    otherwise the script's own folder for normal `python overlay.py` runs."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 # ── ALEXANDRIA COLOR TOKENS ──────────────────────────────────────────────────
 C = {
     "bg":       "#141314",   # outer window bg
@@ -61,6 +71,11 @@ class OverlayApp:
         self._elapsed       = 0
         self._live_state    = True
 
+        self._imgs          = []         # live tk image refs for the active card (GC guard)
+        self._hidden        = False      # overlay hidden via the global show/hide hotkey
+        self._hotkey_id     = None       # id of the registered Win32 global hotkey
+        self._hotkey_thread = None       # daemon thread running the hotkey message loop
+
         self._autoscroll_active   = False
         self._autoscroll_words    = []   # parallel: (start_idx, end_idx) tk positions
         self._word_texts          = []   # parallel: normalized word strings (voice match)
@@ -105,19 +120,43 @@ class OverlayApp:
         self.render_slide()
         self._tick_timer()
         self.root.focus_force()
+        self._register_global_hotkey()
 
     # ── WINDOW ───────────────────────────────────────────────────────────────
 
     def _setup_window(self):
+        self.root.title("AsusServiceOLED")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.93)
         self.root.geometry("700x500+150+100")
         self.root.configure(bg=C["bg"])
         self.root.minsize(MIN_W, MIN_H)
+        self._apply_stealth_style(self.root)
+
+    def _apply_stealth_style(self, window=None):
+        """Ensure the window has WS_EX_TOOLWINDOW and no WS_EX_APPWINDOW
+        so it never appears on the taskbar, in the tray, or in Alt+Tab,
+        and Windows Task Manager classifies it under Background Processes."""
+        if window is None:
+            window = self.root
+        try:
+            window.update_idletasks()
+            inner = window.winfo_id()
+            hwnd  = ctypes.windll.user32.GetParent(inner) or inner
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW  = 0x00040000
+            style = self._user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            self._user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            self._user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+        except Exception:
+            pass
 
     def _cloak(self, window):
         window.update()
+        self._apply_stealth_style(window)
         inner = window.winfo_id()
         hwnd  = ctypes.windll.user32.GetParent(inner) or inner
         ret   = self._user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
@@ -145,14 +184,21 @@ class OverlayApp:
                 pass                     # already destroyed
 
     def _minimize(self):
-        """Minimize via the overrideredirect toggle trick."""
-        self.root.overrideredirect(False)
-        self.root.iconify()
-        self.root.bind("<Map>", self._on_restore)
-
-    def _on_restore(self, event):
-        self.root.overrideredirect(True)
-        self.root.unbind("<Map>")
+        """Collapse or expand the overlay smoothly without ever touching the taskbar."""
+        if getattr(self, "_collapsed", False):
+            self._collapsed = False
+            h = getattr(self, "_saved_height", 500)
+            self.root.minsize(MIN_W, MIN_H)
+            if hasattr(self, "_body"):
+                self._body.pack(fill="both", expand=True)
+            self.root.geometry(f"{self.root.winfo_width()}x{h}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        else:
+            self._collapsed = True
+            self._saved_height = max(self.root.winfo_height(), MIN_H)
+            if hasattr(self, "_body"):
+                self._body.pack_forget()
+            self.root.minsize(MIN_W, 44)
+            self.root.geometry(f"{self.root.winfo_width()}x44+{self.root.winfo_x()}+{self.root.winfo_y()}")
         self._cloak(self.root)
 
     # ── UI BUILD ─────────────────────────────────────────────────────────────
@@ -179,7 +225,7 @@ class OverlayApp:
         for color, symbol, cmd in [
             (C["red"],    "✕", self._quit),
             (C["yellow"], "−", self._minimize),
-            (C["green"],  "●", lambda: None),
+            (C["green"],  "●", self._minimize),
         ]:
             dot = tk.Frame(left, bg=color, width=16, height=16,
                            cursor="hand2")
@@ -235,10 +281,10 @@ class OverlayApp:
     # ── BODY ─────────────────────────────────────────────────────────────────
 
     def _build_body(self):
-        body = tk.Frame(self.root, bg=C["bg"])
-        body.pack(fill="both", expand=True)
-        self._build_sidebar(body)
-        self._build_main_column(body)
+        self._body = tk.Frame(self.root, bg=C["bg"])
+        self._body.pack(fill="both", expand=True)
+        self._build_sidebar(self._body)
+        self._build_main_column(self._body)
 
     # ── SIDEBAR ──────────────────────────────────────────────────────────────
 
@@ -546,6 +592,8 @@ class OverlayApp:
                 if s.startswith(prefix):
                     s = s[len(prefix):]
                     break
+            # Collapse ![alt](...) images to a marker so base64 never bloats previews
+            s = re.sub(r'!\[[^\]]*\]\([^)]*\)', '🖼 image', s)
             # Strip **bold**
             s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
             # Strip ==highlight==
@@ -570,6 +618,7 @@ class OverlayApp:
         self.text.insert("end", "\n")
 
     def _render_active_content(self, slide):
+        self._imgs   = []          # release refs from the previous slide (let tk GC them)
         in_prompt    = False
         blank_pend   = False
         for raw in slide.split('\n'):
@@ -580,6 +629,12 @@ class OverlayApp:
             if blank_pend:
                 self.text.insert("end", "\n")
                 blank_pend = False
+            # A line that is only an image:  ![alt](data:...  |  local path)
+            m_img = re.match(r'^!\[[^\]]*\]\((.+)\)\s*$', line)
+            if m_img:
+                in_prompt = False
+                self._insert_image(m_img.group(1))
+                continue
             if line.startswith('> '):
                 if not in_prompt:
                     self.text.insert("end", "❝  SPEAKER PROMPT\n", "prompt_header")
@@ -591,6 +646,78 @@ class OverlayApp:
                 elif line.startswith('## '):         self._insert_rich(line[3:],  "h2")
                 elif line.startswith(('- ', '* ')): self._insert_rich('  •  ' + line[2:], "bullet")
                 else:                                self._insert_rich(line,      "body")
+
+    # ── IMAGES IN NOTES ──────────────────────────────────────────────────────
+
+    def _load_image(self, src):
+        """Turn an image markdown target into a tk image object, scaled to fit the
+        active card. Accepts data: URLs (from the phone editor) and local file
+        paths (desktop). Uses Pillow for smooth scaling / broad formats when it is
+        installed, else falls back to tk.PhotoImage (PNG/GIF) with integer
+        subsampling. Never touches the network. Returns None if it can't decode."""
+        import base64, io
+        # Available width inside the card; winfo_width is 1 before first layout.
+        try:
+            avail = self.text.winfo_width() - 44
+        except Exception:                    # noqa: BLE001
+            avail = 0
+        if avail < 120:
+            avail = 560
+        max_h = 380
+
+        data = None
+        if src.startswith("data:"):
+            try:
+                data = base64.b64decode(src.split(",", 1)[1])
+            except Exception:                # noqa: BLE001
+                return None
+        else:
+            # local file only — do not fetch http(s), keep the overlay offline
+            if os.path.exists(src):
+                try:
+                    with open(src, "rb") as f:
+                        data = f.read()
+                except Exception:            # noqa: BLE001
+                    return None
+            else:
+                return None
+
+        # Preferred path: Pillow (smooth resize, handles JPEG/WebP/etc.)
+        try:
+            from PIL import Image, ImageTk
+            im = Image.open(io.BytesIO(data)); im.load()
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            scale = min(1.0, avail / im.width, max_h / im.height)
+            if scale < 1.0:
+                im = im.resize((max(1, int(im.width * scale)),
+                                max(1, int(im.height * scale))), Image.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:                    # noqa: BLE001 — Pillow absent or format unsupported
+            pass
+
+        # Fallback: built-in tk image (PNG/GIF), integer downscale only
+        try:
+            b64 = base64.b64encode(data).decode("ascii")
+            img = tk.PhotoImage(data=b64)
+            factor = 1
+            while img.width() // factor > avail or img.height() // factor > max_h:
+                factor += 1
+            if factor > 1:
+                img = img.subsample(factor, factor)
+            return img
+        except Exception:                    # noqa: BLE001
+            return None
+
+    def _insert_image(self, src):
+        img = self._load_image(src)
+        if img is None:
+            self.text.insert("end", "🖼  [image unavailable]\n", "body")
+            return
+        self._imgs.append(img)               # hold a ref or tk garbage-collects it
+        self.text.insert("end", "\n")
+        self.text.image_create("end", image=img)
+        self.text.insert("end", "\n")
 
     def render_slide(self):
         # NOTE: do NOT stop auto-scroll / voice here. render_slide() runs on every
@@ -1208,7 +1335,7 @@ class OverlayApp:
         print(f"[Voice] {msg}")
 
     def _find_vosk_model(self):
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = _app_dir()
         candidates = []
         env = os.environ.get("VOSK_MODEL")
         if env:
@@ -2063,12 +2190,80 @@ class OverlayApp:
         else:
             self._quit()
 
+    # ── GLOBAL SHOW/HIDE HOTKEY (Ctrl+Shift+`) ───────────────────────────────
+
+    def _register_global_hotkey(self):
+        """Register a system-wide Ctrl+Shift+` hotkey that toggles the overlay's
+        visibility even when another window is focused. Uses Win32 RegisterHotKey
+        via ctypes — no extra dependency, so it also works in the packaged .exe.
+        The hotkey needs its own message loop, so it runs on a daemon thread and
+        marshals the toggle back onto the tk loop with root.after()."""
+        try:
+            self._hotkey_thread = threading.Thread(
+                target=self._hotkey_loop, name="global-hotkey", daemon=True)
+            self._hotkey_thread.start()
+        except Exception as e:               # noqa: BLE001 — never block startup
+            print(f"[Hotkey] could not start global hotkey thread: {e}")
+
+    def _hotkey_loop(self):
+        from ctypes import wintypes
+        user32 = self._user32
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                       wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype  = ctypes.c_int
+
+        MOD_SHIFT, MOD_CONTROL, MOD_NOREPEAT = 0x0004, 0x0002, 0x4000
+        VK_OEM_3  = 0xC0        # the ` / ~ key (backtick) on a US layout
+        WM_HOTKEY = 0x0312
+        hk_id     = 0xB1B       # arbitrary unique id for this process
+        mods      = MOD_CONTROL | MOD_SHIFT
+
+        # MOD_NOREPEAT stops key auto-repeat from firing the toggle repeatedly;
+        # it's unsupported before Win7, so fall back without it.
+        if not user32.RegisterHotKey(None, hk_id, mods | MOD_NOREPEAT, VK_OEM_3) \
+           and not user32.RegisterHotKey(None, hk_id, mods, VK_OEM_3):
+            print("[Hotkey] Ctrl+Shift+` unavailable (another app may own it).")
+            return
+        self._hotkey_id = hk_id
+
+        msg = wintypes.MSG()
+        while True:
+            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r in (0, -1):                 # WM_QUIT or error
+                break
+            if msg.message == WM_HOTKEY:
+                try:
+                    self.root.after(0, self._toggle_visibility)
+                except Exception:            # noqa: BLE001 — root gone, stop the loop
+                    break
+        try:
+            user32.UnregisterHotKey(None, hk_id)
+        except Exception:                    # noqa: BLE001
+            pass
+
+    def _toggle_visibility(self):
+        """Hide the overlay, or bring it back on top. Bound to Ctrl+Shift+`."""
+        try:
+            if self._hidden:
+                self.root.deiconify()
+                self.root.overrideredirect(True)      # stay borderless after re-show
+                self.root.attributes("-topmost", True)
+                self._cloak(self.root)                # re-assert capture cloaking
+                self.root.lift()
+                self.root.focus_force()
+                self._hidden = False
+            else:
+                self.root.withdraw()
+                self._hidden = True
+        except tk.TclError:
+            pass
+
 
 # ── .ENV LOADER ──────────────────────────────────────────────────────────────
 
 def _load_dotenv():
     """Load KEY=VALUE pairs from a .env file next to overlay.py (no external deps)."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env_path = os.path.join(_app_dir(), ".env")
     if not os.path.exists(env_path):
         return
     # utf-8-sig strips a BOM — Windows Notepad writes UTF-8 with BOM by default,
