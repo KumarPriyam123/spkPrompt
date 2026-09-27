@@ -1064,6 +1064,10 @@ class OverlayApp:
             delta = data.get("delta", 0)
             if isinstance(delta, int) and delta:
                 self._change_font(delta)
+        elif cmd == "screenshot":
+            req_id = data.get("req_id", "")
+            threading.Thread(target=self._capture_and_send_screenshot,
+                             args=(req_id,), daemon=True).start()
 
     def _scroll_text(self, delta):
         units = max(1, min(50, abs(delta)))
@@ -1071,6 +1075,94 @@ class OverlayApp:
             self.text.yview_scroll(units, "units")
         elif delta < 0:
             self.text.yview_scroll(-units, "units")
+
+    def _take_screenshot_data_url(self):
+        import ctypes, ctypes.wintypes, base64, io
+        from PIL import Image
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        # Virtual screen metrics (covers multi-monitor or single)
+        vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if vw <= 0 or vh <= 0:
+            vw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+            vh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+            vx, vy = 0, 0
+
+        hdc = user32.GetDC(0)
+        memdc = gdi32.CreateCompatibleDC(hdc)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc, vw, vh)
+        old_bmp = gdi32.SelectObject(memdc, hbmp)
+
+        # SRCCOPY = 0x00CC0020, CAPTUREBLT = 0x40000000
+        gdi32.BitBlt(memdc, 0, 0, vw, vh, hdc, vx, vy, 0x00CC0020 | 0x40000000)
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ('biSize', ctypes.wintypes.DWORD), ('biWidth', ctypes.wintypes.LONG),
+                ('biHeight', ctypes.wintypes.LONG), ('biPlanes', ctypes.wintypes.WORD),
+                ('biBitCount', ctypes.wintypes.WORD), ('biCompression', ctypes.wintypes.DWORD),
+                ('biSizeImage', ctypes.wintypes.DWORD), ('biXPelsPerMeter', ctypes.wintypes.LONG),
+                ('biYPelsPerMeter', ctypes.wintypes.LONG), ('biClrUsed', ctypes.wintypes.DWORD),
+                ('biClrImportant', ctypes.wintypes.DWORD)
+            ]
+
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = vw
+        bmi.biHeight = -vh  # top-down DIB
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0
+
+        buf = ctypes.create_string_buffer(vw * vh * 4)
+        gdi32.GetDIBits(memdc, hbmp, 0, vh, buf, ctypes.byref(bmi), 0)
+
+        gdi32.SelectObject(memdc, old_bmp)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(memdc)
+        user32.ReleaseDC(0, hdc)
+
+        im = Image.frombuffer('RGBA', (vw, vh), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+
+        # Limit maximum dimension to 1920 to keep upload small (~50-150KB) for instant sync
+        max_dim = 1920
+        if vw > max_dim or vh > max_dim:
+            ratio = min(max_dim / vw, max_dim / vh)
+            new_w = max(1, int(vw * ratio))
+            new_h = max(1, int(vh * ratio))
+            im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        bio = io.BytesIO()
+        im.save(bio, format='JPEG', quality=85, optimize=True)
+        b64 = base64.b64encode(bio.getvalue()).decode('ascii')
+        return f"data:image/jpeg;base64,{b64}"
+
+    def _capture_and_send_screenshot(self, req_id):
+        try:
+            print(f"[Screenshot] Capturing screen for req {req_id}...")
+            data_url = self._take_screenshot_data_url()
+            payload = {
+                "req_id": req_id,
+                "ts": time.time(),
+                "image": data_url
+            }
+            if self._sync_mode == "firebase" and self._firebase_url:
+                import requests
+                r = requests.put(f"{self._firebase_url}/overlay/screenshot.json",
+                                 data=json.dumps(payload), timeout=10)
+                print(f"[Screenshot] Pushed screenshot to Firebase (HTTP {r.status_code})")
+            elif self._sync_mode == "local":
+                if self._ws_loop and self._ws_clients:
+                    msg = json.dumps({"type": "screenshot", **payload})
+                    self._ws_loop.call_soon_threadsafe(self._ws_broadcast, msg)
+                    print(f"[Screenshot] Broadcasted screenshot to WS clients")
+        except Exception as e:
+            print(f"[Screenshot] Error: {type(e).__name__}: {e}")
 
     def start_firebase_sync(self, db_url):
         self._firebase_url  = db_url.rstrip("/")

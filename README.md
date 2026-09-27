@@ -218,6 +218,7 @@ copilot_profile.example.md  # Template for your private résumé summary
 |-----|--------|
 | `←` / `→` | Previous / next slide |
 | `F9` | Copilot: answer the latest transcribed question (global while copilot mode is on) |
+| `Ctrl` + `Shift` + `Q` | Web UI: take screenshot of presenter's screen & copy directly to client clipboard |
 | `Escape` | Close settings popup / slide switcher / stop copilot / exit |
 
 ---
