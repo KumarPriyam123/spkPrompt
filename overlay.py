@@ -1264,7 +1264,7 @@ class OverlayApp:
         parsed  = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
                    if s.strip()]
         if not parsed:
-            return
+            parsed = [""]   # all text deleted on the phone → blank the card, don't keep stale text
         self.slides  = parsed
         self.current = min(self.current, len(parsed) - 1)
         # Copilot owns the card while active — stash the updated deck but don't
