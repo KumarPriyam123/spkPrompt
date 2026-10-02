@@ -27,6 +27,7 @@ C = {
     "muted":    "#565966",   # prev/next preview text
     "outline":  "#434653",   # separators
     "tertiary": "#dcc661",   # archival gold
+    "gold":     "#dcc661",   # alias for tertiary
     "red":      "#ff5f56",
     "yellow":   "#ffbd2e",
     "green":    "#27c93f",
@@ -46,7 +47,7 @@ class OverlayApp:
 
     def __init__(self, root):
         self.root      = root
-        self.slides    = ["# Welcome\n\nOpen a file via ⚙  or connect to sync."]
+        self.slides    = [""]                # blank body until notes load / sync
         self.current   = 0
         self.font_size = 12
 
@@ -72,6 +73,8 @@ class OverlayApp:
         self._live_state    = True
 
         self._imgs          = []         # live tk image refs for the active card (GC guard)
+        self._img_store     = {}         # image token store: "1" -> data URL (prevents raw bytes in editor)
+        self._readonly      = False      # read-only presenter mode (locks click-to-edit)
         self._hidden        = False      # overlay hidden via the global show/hide hotkey
         self._hotkey_id     = None       # id of the registered Win32 global hotkey
         self._hotkey_thread = None       # daemon thread running the hotkey message loop
@@ -222,16 +225,18 @@ class OverlayApp:
         left.bind("<ButtonPress-1>", self._start_drag)
         left.bind("<B1-Motion>",     self._do_drag)
 
-        for color, symbol, cmd in [
-            (C["red"],    "✕", self._quit),
-            (C["yellow"], "−", self._minimize),
-            (C["green"],  "●", self._minimize),
+        # Muted window controls — same grey as separators, so they don't pull
+        # the eye away from the notes.
+        for symbol, cmd in [
+            ("✕", self._quit),
+            ("−", self._minimize),
+            ("●", self._minimize),
         ]:
-            dot = tk.Frame(left, bg=color, width=16, height=16,
+            dot = tk.Frame(left, bg=C["outline"], width=16, height=16,
                            cursor="hand2")
             dot.pack(side="left", padx=3)
             dot.pack_propagate(False)
-            lbl = tk.Label(dot, text=symbol, bg=color, fg=C["bar"],
+            lbl = tk.Label(dot, text=symbol, bg=C["outline"], fg=C["on_sv"],
                            font=(SANS, 8, "bold"), cursor="hand2")
             lbl.place(relx=0.5, rely=0.5, anchor="center")
             for w in (dot, lbl):
@@ -246,6 +251,11 @@ class OverlayApp:
         title.bind("<ButtonPress-1>", self._start_drag)
         title.bind("<B1-Motion>",     self._do_drag)
 
+        # Read-only indicator: just "R", packed only while read-only (click = exit)
+        self._ro_badge = tk.Label(left, text="R", bg=C["gold"], fg=C["bar"],
+                                  font=(LABEL, 8, "bold"), padx=5, cursor="hand2")
+        self._ro_badge.bind("<Button-1>", lambda e: self._toggle_readonly())
+
         # Right cluster
         right = tk.Frame(bar, bg=C["bar"])
         right.pack(side="right", padx=(0, 14))
@@ -256,6 +266,25 @@ class OverlayApp:
             activebackground=C["bar"], activeforeground=C["primary"],
             relief="flat", command=self._open_settings)
         self._gear_btn.pack(side="right", padx=(6, 0))
+
+        # ── QUICK VISIBILITY / OPACITY SLIDER ──
+        op_f = tk.Frame(right, bg=C["bar"])
+        op_f.pack(side="right", padx=(6, 10))
+        tk.Label(op_f, text="👁", bg=C["bar"], fg=C["on_sv"],
+                 font=(SANS, 10)).pack(side="left", padx=(0, 2))
+        curr_alpha = int(round(self.root.attributes("-alpha") * 100)) if self.root.attributes("-alpha") else 95
+        self._top_op_label = tk.Label(op_f, text=f"{curr_alpha}%", bg=C["bar"],
+                                      fg=C["on_sv"], font=(LABEL, 8, "bold"),
+                                      width=4, anchor="w")
+        self._top_op_label.pack(side="left")
+        self._top_op_scale = tk.Scale(
+            op_f, from_=0, to=100, orient="horizontal",
+            showvalue=False, length=64, width=12, sliderlength=14,
+            bg=C["bar"], troughcolor=C["card_act"], highlightthickness=0,
+            bd=0, sliderrelief="flat", activebackground=C["primary"],
+            cursor="hand2", command=self._on_opacity)
+        self._top_op_scale.set(curr_alpha)
+        self._top_op_scale.pack(side="left", padx=(2, 0))
 
         tk.Frame(right, bg=C["outline"], width=1).pack(
             side="right", fill="y", pady=10, padx=8)
@@ -292,6 +321,7 @@ class OverlayApp:
         sb = tk.Frame(parent, bg=C["bar"], width=72)
         sb.pack(side="left", fill="y")
         sb.pack_propagate(False)
+        self._sidebar = sb
 
         self._active_tab  = "notes"
         self._tab_widgets = {}
@@ -360,6 +390,7 @@ class OverlayApp:
         bar = tk.Frame(parent, bg=C["bar"], height=40)
         bar.pack(fill="x")
         bar.pack_propagate(False)
+        self._statusbar = bar
 
         self._breadcrumb = tk.Label(bar, text="",
                                     bg=C["bar"], fg=C["outline"],
@@ -379,7 +410,15 @@ class OverlayApp:
                   side="left", padx=(0, 2))
         tk.Button(right, text="A+",
                   command=lambda: self._change_font(1),  **_b).pack(
-                  side="left", padx=(0, 10))
+                  side="left", padx=(0, 8))
+
+        self._readonly_btn = tk.Button(
+            right, text="EDITABLE", command=self._toggle_readonly,
+            bg="#252829", fg="#ffffff", bd=1, relief="solid",
+            font=(SANS, 8, "bold"), cursor="hand2",
+            activebackground=C["primary"], activeforeground=C["bg"],
+            padx=10, pady=4)
+        self._readonly_btn.pack(side="left", padx=(0, 8))
 
         self._auto_btn = tk.Button(
             right, text="▶  AUTO", command=self._toggle_autoscroll,
@@ -485,6 +524,13 @@ class OverlayApp:
             insertwidth=0)
         self.text.grid(row=1, column=0, sticky="nsew")
         self.text.bind("<Button-1>", self._on_text_click)
+        self.text.bind("<B1-Motion>", self._on_text_motion)
+
+        # Content area drag handlers for read mode
+        for w in (vp, ac_outer, accent, inner, self._manuscript_lbl, self._body, self._main_col):
+            w.bind("<ButtonPress-1>", self._on_content_drag_start)
+            w.bind("<B1-Motion>",     self._on_content_drag_motion)
+
         self._configure_tags()
 
         # ── NEXT CARD ──
@@ -629,11 +675,16 @@ class OverlayApp:
             if blank_pend:
                 self.text.insert("end", "\n")
                 blank_pend = False
-            # A line that is only an image:  ![alt](data:...  |  local path)
+            # A line that is only an image:  ![alt](data:...  |  img:N  |  local path)
             m_img = re.match(r'^!\[[^\]]*\]\((.+)\)\s*$', line)
             if m_img:
                 in_prompt = False
-                self._insert_image(m_img.group(1))
+                target = m_img.group(1).strip()
+                if target.startswith("img:"):
+                    target = self._img_store.get(target[4:], target)
+                elif target.startswith("data:"):
+                    self._collapse_images(line)  # cache in store
+                self._insert_image(target)
                 continue
             if line.startswith('> '):
                 if not in_prompt:
@@ -648,6 +699,43 @@ class OverlayApp:
                 else:                                self._insert_rich(line,      "body")
 
     # ── IMAGES IN NOTES ──────────────────────────────────────────────────────
+
+    def _collapse_images(self, text):
+        """Replace ![alt](data:image/...) with ![alt](img:N) so raw base64 never
+        bloats or corrupts the editor while editing."""
+        if not text:
+            return ""
+
+        def _repl(m):
+            alt = m.group(1) or "photo"
+            url = m.group(2).strip()
+            clean_url = re.sub(r'\s+', '', url)
+            matched_id = None
+            for k, v in self._img_store.items():
+                if v == clean_url or v == url:
+                    matched_id = k
+                    break
+            if not matched_id:
+                matched_id = str(len(self._img_store) + 1)
+                self._img_store[matched_id] = clean_url
+            label = alt if alt and alt != "image" else f"photo {matched_id}"
+            return f"![{label}](img:{matched_id})"
+
+        return re.sub(r'!\[([^\]]*)\]\((data:image\/[^)]+)\)', _repl, text)
+
+    def _expand_images(self, text):
+        """Expand ![alt](img:N) back into ![alt](data:image/...) using _img_store."""
+        if not text:
+            return ""
+
+        def _repl(m):
+            alt = m.group(1) or "photo"
+            token_id = m.group(2)
+            if token_id in self._img_store:
+                return f"![{alt}]({self._img_store[token_id]})"
+            return m.group(0)
+
+        return re.sub(r'!\[([^\]]*)\]\(img:(\d+)\)', _repl, text)
 
     def _load_image(self, src):
         """Turn an image markdown target into a tk image object, scaled to fit the
@@ -664,6 +752,10 @@ class OverlayApp:
         if avail < 120:
             avail = 560
         max_h = 380
+
+        if src.startswith("img:"):
+            token_id = src[4:]
+            src = self._img_store.get(token_id, src)
 
         data = None
         if src.startswith("data:"):
@@ -725,8 +817,10 @@ class OverlayApp:
         # what broke "click a word and keep scrolling". Following is stopped only
         # on real navigation (see navigate / navigate_to / load_file).
 
+        readonly = getattr(self, "_readonly", False)  # read-only = notes text only
+
         # ── PREV CARD ──
-        if self.current > 0:
+        if self.current > 0 and not readonly:
             prev_title   = self._extract_title(self.slides[self.current - 1]) or ""
             prev_preview = self._preview_text(self.slides[self.current - 1])
             self._prev_nav.config(
@@ -742,10 +836,10 @@ class OverlayApp:
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         self._render_active_content(self.slides[self.current])
-        self.text.config(state="disabled")
+        self.text.config(state="disabled", cursor="arrow")
 
         # ── NEXT CARD ──
-        if self.current < len(self.slides) - 1:
+        if self.current < len(self.slides) - 1 and not readonly:
             next_title   = self._extract_title(self.slides[self.current + 1]) or ""
             next_preview = self._preview_text(self.slides[self.current + 1])
             self._next_nav.config(
@@ -799,15 +893,63 @@ class OverlayApp:
 
     # ── INLINE EDITING (two-way sync) ────────────────────────────────────────
 
+    def _toggle_readonly(self):
+        self._readonly = not self._readonly
+        if self._readonly:
+            if self._editing:
+                self._commit_edit()
+            if self._logs_visible:
+                self._hide_logs()
+            self._readonly_btn.config(
+                text="READ ONLY", bg="#dcc661", fg="#141314",
+                activebackground="#dcc661", activeforeground="#141314")
+            self.text.config(state="disabled")
+            # Notes text only: drop sidebar, button bar, header, prev/next cards;
+            # the top bar just shows an "R" badge.
+            self._sidebar.pack_forget()
+            self._statusbar.pack_forget()
+            self._manuscript_lbl.grid_remove()
+            self._prev_card.grid_remove()
+            self._next_card.grid_remove()
+            self._ro_badge.pack(side="left", padx=(8, 0))
+            print("[Mode] READ ONLY mode activated - drag anywhere to move")
+        else:
+            self._readonly_btn.config(
+                text="EDITABLE", bg="#252829", fg="#ffffff",
+                activebackground=C["primary"], activeforeground=C["bg"])
+            self._ro_badge.pack_forget()
+            self._sidebar.pack(side="left", fill="y", before=self._main_col)
+            self._statusbar.pack(fill="x", before=self._vp)
+            self._manuscript_lbl.grid()
+            self.text.config(state="normal", cursor="arrow")
+            self.render_slide()
+            if hasattr(self, "_breadcrumb") and self._breadcrumb.winfo_exists():
+                self._breadcrumb.config(text="EDITABLE: CLICK TEXT TO EDIT", fg=C["primary"])
+                self.root.after(2000, self._update_statusbar)
+            print("[Mode] EDITABLE mode activated - click text to edit notes")
+
+    def _on_content_drag_start(self, event):
+        if getattr(self, "_readonly", False):
+            self._start_drag(event)
+            return "break"
+
+    def _on_content_drag_motion(self, event):
+        if getattr(self, "_readonly", False):
+            self._do_drag(event)
+            return "break"
+
     def _on_text_click(self, event):
         """Single click on the active card.
 
         While following along (voice / auto-scroll) a click re-seeks the
         highlight to that word. Otherwise it drops straight into edit mode
-        with the caret placed where you clicked.
+        with the caret placed where you clicked (unless in read-only mode).
         """
         if self._editing:
             return              # already editing — let default caret placement run
+        if getattr(self, "_readonly", False):
+            self._start_drag(event)
+            return "break"      # READ ONLY: drag window instead of entering edit mode!
         if self._copilot_active:
             return "break"      # copilot owns the card; no edit/seek
         if self._voice_active or self._autoscroll_active:
@@ -815,9 +957,14 @@ class OverlayApp:
         self._enter_edit_mode(event)
         return "break"          # we place the caret ourselves
 
+    def _on_text_motion(self, event):
+        if getattr(self, "_readonly", False):
+            self._do_drag(event)
+            return "break"
+
     def _enter_edit_mode(self, event=None):
-        """Edit the raw markdown of the current slide, caret at the click point."""
-        if self._editing:
+        """Edit the raw markdown of the current slide, with collapsed image tokens."""
+        if self._editing or getattr(self, "_readonly", False):
             return
         if self._autoscroll_active:
             self._toggle_autoscroll()
@@ -830,7 +977,10 @@ class OverlayApp:
         for tag in ("h1", "h2", "body", "bold", "bullet",
                     "prompt_header", "prompt_body", "keyword", "autoscroll_hl"):
             self.text.tag_remove(tag, "1.0", "end")
-        self.text.insert("1.0", self.slides[self.current])
+
+        editable = self._collapse_images(self.slides[self.current])
+        self.text.insert("1.0", editable)
+
         self._manuscript_lbl.config(
             text=f"✏  EDITING  ·  SLIDE {self.current + 1}  ·  Esc or click away to save")
         self.text.focus_set()
@@ -845,6 +995,54 @@ class OverlayApp:
         self.text.bind("<FocusOut>", self._commit_edit)
         self.text.bind("<Escape>",   self._commit_edit)
         self.text.bind("<KeyRelease>", self._on_edit_key)
+        self.text.bind("<Control-v>", self._on_edit_paste)
+        self.text.bind("<Control-V>", self._on_edit_paste)
+
+    def _on_edit_paste(self, event=None):
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grabclipboard()
+            if img is not None:
+                if isinstance(img, list):
+                    if img and isinstance(img[0], str) and img[0].lower().endswith(
+                            ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')):
+                        from PIL import Image
+                        img = Image.open(img[0])
+                    else:
+                        img = None
+                if img is not None and hasattr(img, 'convert'):
+                    import io, base64
+                    im = img.convert('RGB')
+                    max_dim = 1200
+                    w, h = im.size
+                    if w > max_dim or h > max_dim:
+                        ratio = min(max_dim / w, max_dim / h)
+                        new_w = max(1, int(w * ratio))
+                        new_h = max(1, int(h * ratio))
+                        im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    bio = io.BytesIO()
+                    im.save(bio, format='JPEG', quality=85)
+                    b64 = base64.b64encode(bio.getvalue()).decode('ascii')
+                    data_url = f"data:image/jpeg;base64,{b64}"
+                    img_id = str(len(self._img_store) + 1)
+                    self._img_store[img_id] = data_url
+                    md = f"\n![photo {img_id}](img:{img_id})\n"
+                    self.text.insert("insert", md)
+                    return "break"
+        except Exception as e:
+            print(f"[Paste] image paste error: {e}")
+
+        # Check if clipboard has markdown text containing data URLs
+        try:
+            clip = self.root.clipboard_get()
+            if clip and "](data:image/" in clip:
+                collapsed = self._collapse_images(clip)
+                self.text.insert("insert", collapsed)
+                return "break"
+        except Exception:
+            pass
+
+        return None
 
     def _commit_edit(self, event=None):
         if not self._editing:
@@ -854,9 +1052,12 @@ class OverlayApp:
             self.root.after_cancel(self._live_after)
             self._live_after = None
         new_content = self.text.get("1.0", "end-1c")
+        new_content = self._expand_images(new_content)
         self.text.unbind("<FocusOut>")
         self.text.unbind("<Escape>")
         self.text.unbind("<KeyRelease>")
+        self.text.unbind("<Control-v>")
+        self.text.unbind("<Control-V>")
         self.text.config(cursor="arrow", insertwidth=0)
         # An edit may introduce `---` separators — re-split the edited slide.
         pieces = [s.strip() for s in re.split(r'\n\s*---\s*\n', new_content)
@@ -895,6 +1096,7 @@ class OverlayApp:
         if not self._editing:
             return
         buffer = self.text.get("1.0", "end-1c")
+        buffer = self._expand_images(buffer)
         parts  = list(self.slides)
         if 0 <= self.current < len(parts):
             parts[self.current] = buffer
@@ -1059,7 +1261,7 @@ class OverlayApp:
         elif cmd == "opacity":
             val = data.get("value")
             if isinstance(val, (int, float)):
-                self._on_opacity(str(max(20, min(100, int(val)))))
+                self._on_opacity(str(max(0, min(100, int(val)))))
         elif cmd == "font":
             delta = data.get("delta", 0)
             if isinstance(delta, int) and delta:
@@ -2110,7 +2312,7 @@ class OverlayApp:
             text=f"{int(self.root.attributes('-alpha')*100)}%", **_lbl)
         self._op_label.pack(side="right")
 
-        tk.Scale(win, from_=20, to=100, resolution=1, orient="horizontal",
+        tk.Scale(win, from_=0, to=100, resolution=1, orient="horizontal",
                  showvalue=False, bg=C["prompt"], troughcolor=C["outline"],
                  highlightthickness=0, bd=0, sliderrelief="flat",
                  activebackground=C["primary"], command=self._on_opacity
@@ -2247,10 +2449,38 @@ class OverlayApp:
         print(f"WebSocket server on {ip}:{port}")
 
     def _on_opacity(self, val):
-        v = int(val)
+        v = int(float(val))
         self.root.attributes("-alpha", v / 100)
-        if hasattr(self, "_op_label"):
-            self._op_label.config(text=f"{v}%")
+        pct = f"{v}%"
+        if hasattr(self, "_op_label") and self._op_label.winfo_exists():
+            self._op_label.config(text=pct)
+        if hasattr(self, "_top_op_label") and self._top_op_label.winfo_exists():
+            self._top_op_label.config(text=pct)
+        if hasattr(self, "_top_op_scale") and self._top_op_scale.winfo_exists():
+            if abs(self._top_op_scale.get() - v) > 1:
+                self._top_op_scale.set(v)
+
+    # Alt+D / Alt+I stops: 10% steps down to 20, then finer 5% steps to 0.
+    OPACITY_STEPS = (0, 5, 10, 15, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+
+    def _adjust_opacity(self, delta):
+        try:
+            if hasattr(self, "_top_op_scale") and self._top_op_scale.winfo_exists():
+                curr = int(self._top_op_scale.get())
+            else:
+                curr = int(round(self.root.attributes("-alpha") * 100))
+        except Exception:
+            curr = 95
+        # Next stop in the pressed direction (works from any slider value too).
+        if delta < 0:
+            new_val = max((s for s in self.OPACITY_STEPS if s < curr), default=0)
+        else:
+            new_val = min((s for s in self.OPACITY_STEPS if s > curr), default=100)
+        self._on_opacity(new_val)
+        if hasattr(self, "_breadcrumb") and self._breadcrumb.winfo_exists():
+            self._breadcrumb.config(text=f"WINDOW OPACITY: {new_val}%", fg=C["primary"])
+            self.root.after(1500, self._update_statusbar)
+        print(f"[Opacity] Changed to {new_val}%")
 
     # ── RESIZE HANDLES ───────────────────────────────────────────────────────
 
@@ -2312,6 +2542,9 @@ class OverlayApp:
     def _start_drag(self, event):
         self._drag_x = event.x_root - self.root.winfo_x()
         self._drag_y = event.y_root - self.root.winfo_y()
+        # Pure-Tk move only: a native WM_NCLBUTTONDOWN/HTCAPTION SendMessage here
+        # enters a modal move loop that re-enters Tk callbacks while ctypes has
+        # released the GIL -> fatal "PyEval_RestoreThread" crash, no drag.
 
     def _do_drag(self, event):
         self.root.geometry(
@@ -2325,6 +2558,65 @@ class OverlayApp:
         self.root.bind("<Escape>", self._handle_escape)
         self.root.bind("<Control-Shift-Q>", lambda e: self._on_screenshot_hotkey())
         self.root.bind("<Control-Shift-q>", lambda e: self._on_screenshot_hotkey())
+        self.root.bind("<F2>", lambda e: self._toggle_readonly())
+        self.root.bind("<Control-e>", lambda e: self._toggle_readonly())
+        self.root.bind("<Control-E>", lambda e: self._toggle_readonly())
+
+        # Alt+D to decrease opacity, Alt+I to increase opacity (10% step)
+        # Also Ctrl+[ to decrease, Ctrl+] to increase
+        for seq in (
+            "<Alt-d>", "<Alt-D>", "<Alt-Key-d>", "<Alt-Key-D>",
+            "<Mod1-d>", "<Mod1-D>", "<Control-bracketleft>",
+        ):
+            try:
+                self.root.bind(seq, lambda e: (self._adjust_opacity(-10), "break")[-1])
+                self.root.bind_all(seq, lambda e: (self._adjust_opacity(-10), "break")[-1])
+            except Exception:
+                pass
+
+        for seq in (
+            "<Alt-i>", "<Alt-I>", "<Alt-Key-i>", "<Alt-Key-I>",
+            "<Mod1-i>", "<Mod1-I>", "<Control-bracketright>",
+        ):
+            try:
+                self.root.bind(seq, lambda e: (self._adjust_opacity(10), "break")[-1])
+                self.root.bind_all(seq, lambda e: (self._adjust_opacity(10), "break")[-1])
+            except Exception:
+                pass
+
+        def _on_key_any(e):
+            is_alt = bool(e.state & 0x20000) or bool(e.state & 0x08)
+            if is_alt:
+                k = (e.keysym or "").lower()
+                if k == "d":
+                    self._adjust_opacity(-10)
+                    return "break"
+                elif k == "i":
+                    self._adjust_opacity(10)
+                    return "break"
+
+        self.root.bind_all("<KeyPress>", _on_key_any)
+        # System-wide opacity hotkeys come from _hotkey_loop (RegisterHotKey);
+        # the `keyboard` hook is only a fallback there — binding both here made
+        # one keypress fire twice (20% steps).
+
+        # In-app toggle show/hide visibility shortcuts
+        for seq in (
+            "<Control-grave>",
+            "<Control-asciitilde>",
+            "<Control-Shift-grave>",
+            "<Control-Shift-asciitilde>",
+            "<Control-quoteleft>",
+            "<Control-Shift-quoteleft>",
+            "<Control-h>",
+            "<Control-H>",
+            "<Control-Shift-h>",
+            "<Control-Shift-H>",
+        ):
+            try:
+                self.root.bind(seq, lambda e: self._toggle_visibility())
+            except Exception:
+                pass
 
     def _on_screenshot_hotkey(self):
         req_id = f"local_{int(time.time()*1000)}"
@@ -2341,14 +2633,13 @@ class OverlayApp:
         else:
             self._quit()
 
-    # ── GLOBAL SHOW/HIDE HOTKEY (Ctrl+Shift+`) ───────────────────────────────
+    # ── GLOBAL SHOW/HIDE HOTKEY (Ctrl+Shift+` / Ctrl+` / Ctrl+Shift+H) ───────
 
     def _register_global_hotkey(self):
-        """Register a system-wide Ctrl+Shift+` hotkey that toggles the overlay's
-        visibility even when another window is focused. Uses Win32 RegisterHotKey
-        via ctypes — no extra dependency, so it also works in the packaged .exe.
-        The hotkey needs its own message loop, so it runs on a daemon thread and
-        marshals the toggle back onto the tk loop with root.after()."""
+        """Register system-wide hotkeys (Ctrl+Shift+`, Ctrl+`, Ctrl+Shift+H, Ctrl+H)
+        that toggle the overlay's visibility even when another window is focused.
+        Uses Win32 RegisterHotKey via ctypes — no extra dependency, works in both
+        Python and the packaged standalone .exe."""
         try:
             self._hotkey_thread = threading.Thread(
                 target=self._hotkey_loop, name="global-hotkey", daemon=True)
@@ -2362,51 +2653,192 @@ class OverlayApp:
         user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
                                        wintypes.HWND, wintypes.UINT, wintypes.UINT]
         user32.GetMessageW.restype  = ctypes.c_int
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                        wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        user32.PeekMessageW.restype  = wintypes.BOOL
+
+        # Ensure the worker thread has a Win32 message queue established
+        dummy = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(dummy), None, 0, 0, 0)
 
         MOD_SHIFT, MOD_CONTROL, MOD_NOREPEAT = 0x0004, 0x0002, 0x4000
-        VK_OEM_3  = 0xC0        # the ` / ~ key (backtick) on a US layout
+        MOD_ALT   = 0x0001
+        VK_OEM_3  = 0xC0        # the ` / ~ key (backtick) on a standard keyboard
+        VK_H      = 0x48        # H key
+        VK_D      = 0x44        # D key
+        VK_I      = 0x49        # I key
+        VK_OEM_4  = 0xDB        # [ key
+        VK_OEM_6  = 0xDD        # ] key
         WM_HOTKEY = 0x0312
-        hk_id     = 0xB1B       # arbitrary unique id for this process
-        mods      = MOD_CONTROL | MOD_SHIFT
 
-        # MOD_NOREPEAT stops key auto-repeat from firing the toggle repeatedly;
-        # it's unsupported before Win7, so fall back without it.
-        if not user32.RegisterHotKey(None, hk_id, mods | MOD_NOREPEAT, VK_OEM_3) \
-           and not user32.RegisterHotKey(None, hk_id, mods, VK_OEM_3):
-            print("[Hotkey] Ctrl+Shift+` unavailable (another app may own it).")
+        HK_VIS_1   = 0xB1B
+        HK_VIS_2   = 0xB1C
+        HK_VIS_3   = 0xB1D
+        HK_VIS_4   = 0xB1E
+        HK_OP_DEC  = 0xB1F
+        HK_OP_INC  = 0xB20
+        HK_OP_DEC2 = 0xB21
+        HK_OP_INC2 = 0xB22
+        HK_OP_DEC3 = 0xB23
+        HK_OP_INC3 = 0xB24
+
+        candidates = [
+            (HK_VIS_1,   MOD_CONTROL | MOD_SHIFT, VK_OEM_3, "Ctrl+Shift+`"),
+            (HK_VIS_2,   MOD_CONTROL,             VK_OEM_3, "Ctrl+`"),
+            (HK_VIS_3,   MOD_CONTROL | MOD_SHIFT, VK_H,     "Ctrl+Shift+H"),
+            (HK_VIS_4,   MOD_CONTROL,             VK_H,     "Ctrl+H"),
+            (HK_OP_DEC,  MOD_ALT,                 VK_D,     "Alt+D"),
+            (HK_OP_INC,  MOD_ALT,                 VK_I,     "Alt+I"),
+            (HK_OP_DEC2, MOD_ALT | MOD_SHIFT,     VK_D,     "Alt+Shift+D"),
+            (HK_OP_INC2, MOD_ALT | MOD_SHIFT,     VK_I,     "Alt+Shift+I"),
+            (HK_OP_DEC3, MOD_CONTROL,             VK_OEM_4, "Ctrl+["),
+            (HK_OP_INC3, MOD_CONTROL,             VK_OEM_6, "Ctrl+]"),
+        ]
+
+        ERROR_HOTKEY_ALREADY_REGISTERED = 1409
+        registered_ids = []
+
+        def _register(cands):
+            """Register each candidate; return the ones refused as already taken."""
+            taken = []
+            for cand in cands:
+                hk_id, mods, vk, name = cand
+                # Try with MOD_NOREPEAT first, then fallback without it
+                if user32.RegisterHotKey(None, hk_id, mods | MOD_NOREPEAT, vk) or \
+                   user32.RegisterHotKey(None, hk_id, mods, vk):
+                    registered_ids.append(hk_id)
+                    continue
+                err = ctypes.get_last_error()
+                if err == ERROR_HOTKEY_ALREADY_REGISTERED:
+                    taken.append(cand)
+                else:
+                    print(f"[Hotkey] {name} registration skipped (error {err})")
+            return taken
+
+        # Error 1409 almost always means an earlier overlay (often hidden via
+        # Ctrl+H, so invisible and off the taskbar) still owns the keys — then
+        # Alt+D/Alt+I etc. silently drive THAT window, not this one. Newest
+        # launch wins: close the old instance and take the keys over.
+        taken = _register(candidates)
+        if taken and self._close_other_instances():
+            for _ in range(20):                  # wait up to ~2 s for it to exit
+                time.sleep(0.1)
+                taken = _register(taken)
+                if not taken:
+                    break
+            if not taken:
+                print("[Hotkey] Closed a previous overlay instance and took over its hotkeys.")
+        for _, _, _, name in taken:
+            print(f"[Hotkey] {name} registration skipped (already in use by another program)")
+
+        # Fallback: opacity keys RegisterHotKey couldn't take go through the
+        # `keyboard` low-level hook instead (no double-fire: only for failed ids).
+        fallback = [(hk, d) for hk_id, hk, d in ((HK_OP_DEC,  "alt+d",  -10),
+                                                 (HK_OP_INC,  "alt+i",   10),
+                                                 (HK_OP_DEC3, "ctrl+[", -10),
+                                                 (HK_OP_INC3, "ctrl+]",  10))
+                    if hk_id not in registered_ids]
+        if fallback:
+            try:
+                import keyboard
+                for hk, d in fallback:
+                    keyboard.add_hotkey(
+                        hk, lambda d=d: self.root.after(0, lambda: self._adjust_opacity(d)),
+                        suppress=False)
+                print(f"[Hotkey] keyboard-hook fallback for: {', '.join(h for h, _ in fallback)}")
+            except Exception as e:           # noqa: BLE001 — optional dependency
+                print(f"[Hotkey] keyboard-hook fallback unavailable: {e}")
+
+        if not registered_ids:
+            print("[Hotkey] Warning: All candidate global hotkeys failed to register.")
             return
-        self._hotkey_id = hk_id
+
+        self._hotkey_ids = registered_ids
 
         msg = wintypes.MSG()
         while True:
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if r in (0, -1):                 # WM_QUIT or error
                 break
-            if msg.message == WM_HOTKEY:
+            if msg.message == WM_HOTKEY and msg.wParam in registered_ids:
                 try:
-                    self.root.after(0, self._toggle_visibility)
+                    if msg.wParam in (HK_VIS_1, HK_VIS_2, HK_VIS_3, HK_VIS_4):
+                        self.root.after(0, self._toggle_visibility)
+                    elif msg.wParam in (HK_OP_DEC, HK_OP_DEC2, HK_OP_DEC3):
+                        self.root.after(0, lambda: self._adjust_opacity(-10))
+                    elif msg.wParam in (HK_OP_INC, HK_OP_INC2, HK_OP_INC3):
+                        self.root.after(0, lambda: self._adjust_opacity(10))
                 except Exception:            # noqa: BLE001 — root gone, stop the loop
                     break
-        try:
-            user32.UnregisterHotKey(None, hk_id)
-        except Exception:                    # noqa: BLE001
-            pass
+
+        for hk_id in registered_ids:
+            try:
+                user32.UnregisterHotKey(None, hk_id)
+            except Exception:                    # noqa: BLE001
+                pass
+
+    def _close_other_instances(self):
+        """Ask every other overlay process's main window to close (WM_CLOSE runs
+        its normal _quit teardown). Matches Tk's toplevel class + our window
+        title, skipping this process. Returns how many were asked."""
+        from ctypes import wintypes
+        user32 = self._user32
+        user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
+                                         wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowExW.restype  = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        WM_CLOSE = 0x0010
+        me, asked, hwnd = os.getpid(), 0, None
+        while True:
+            hwnd = user32.FindWindowExW(None, hwnd, "TkTopLevel", "AsusServiceOLED")
+            if not hwnd:
+                break
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value and pid.value != me:
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                asked += 1
+                print(f"[Hotkey] asked previous overlay instance (PID {pid.value}) to close")
+        return asked
 
     def _toggle_visibility(self):
-        """Hide the overlay, or bring it back on top. Bound to Ctrl+Shift+`."""
+        """Hide the overlay, or bring it back on top and focus it."""
         try:
-            if self._hidden:
+            is_viewable = False
+            try:
+                is_viewable = bool(self.root.winfo_viewable())
+            except Exception:
+                pass
+
+            if self._hidden or not is_viewable:
                 self.root.deiconify()
                 self.root.overrideredirect(True)      # stay borderless after re-show
                 self.root.attributes("-topmost", True)
                 self._cloak(self.root)                # re-assert capture cloaking
                 self.root.lift()
                 self.root.focus_force()
+                try:
+                    inner = self.root.winfo_id()
+                    hwnd = self._user32.GetParent(inner) or inner
+                    HWND_TOPMOST = -1
+                    SWP_NOMOVE = 0x0002
+                    SWP_NOSIZE = 0x0001
+                    SWP_SHOWWINDOW = 0x0040
+                    self._user32.SetWindowPos(
+                        hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                    )
+                    self._user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
                 self._hidden = False
             else:
                 self.root.withdraw()
                 self._hidden = True
-        except tk.TclError:
+        except (tk.TclError, Exception):
             pass
 
 

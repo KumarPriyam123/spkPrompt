@@ -500,15 +500,29 @@ main {
   white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word;
   tab-size: 2; background: transparent;
 }
-.hl-layer {
-  pointer-events: none; user-select: none;
-  color: var(--hl-body); margin: 0; overflow: hidden;
+/* contenteditable editor: one <div class="ln"> per markdown line, so image
+   lines can render the actual photo instead of their img:N token */
+.editor-ce { color: var(--hl-body); caret-color: var(--text-1); }
+.editor-ce .ln { position: relative; }
+.editor-ce ::selection { background: color-mix(in srgb, var(--primary) 28%, transparent); }
+.editor-ce.is-empty > .ln:first-child::before {
+  content: attr(data-placeholder); position: absolute; left: 0; top: 0;
+  color: var(--text-3); pointer-events: none;
 }
-.editor-ta {
-  color: transparent; -webkit-text-fill-color: transparent;
-  caret-color: var(--text-1); resize: none; overflow: hidden; z-index: 1;
+.ln-img { padding: 6px 0; user-select: none; }
+.img-wrap { position: relative; display: inline-block; max-width: 100%; vertical-align: top; }
+.img-wrap img {
+  display: block; max-width: 100%; max-height: 280px;
+  border-radius: var(--r-sm); border: 1px solid var(--outline);
 }
-.editor-ta::selection { background: color-mix(in srgb, var(--primary) 28%, transparent); }
+.img-del {
+  position: absolute; top: 6px; right: 6px;
+  width: 24px; height: 24px; border-radius: 50%;
+  background: rgba(0,0,0,.55); color: #fff; font-size: 12px; line-height: 24px;
+  opacity: 0; transition: opacity .15s;
+}
+.img-wrap:hover .img-del, .img-del:focus { opacity: 1; }
+@media (hover: none) { .img-del { opacity: .85; } }   /* touch: no hover, keep visible */
 
 /* Highlight classes */
 .hl-h1     { color: var(--hl-h1);     font-weight: 700; }
@@ -517,30 +531,8 @@ main {
 .hl-prompt { color: var(--hl-prompt); font-style: italic; }
 .hl-bold   { color: var(--hl-bold);   font-weight: 700; }
 .hl-body   { color: var(--hl-body); }
-/* image lines show a short token (![photo 1](img:1)) — the base64 lives in
-   imgById and is only expanded when syncing. Colour only (no weight/style change)
-   so the highlight layer stays character-aligned with the textarea caret. */
+/* an img:N token whose photo isn't loaded (e.g. typed by hand) stays as text */
 .hl-img    { color: var(--primary); }
-
-/* thumbnails of the photos on the current slide (tap → selects its token line) */
-.img-strip {
-  display: none; gap: 12px; overflow-x: auto;
-  padding: 10px 16px 12px 60px;
-  border-top: 1px solid var(--outline);
-}
-.img-strip.visible { display: flex; }
-.img-thumb {
-  flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 4px;
-}
-.img-thumb img {
-  display: block; height: 64px; max-width: 120px; object-fit: cover;
-  border-radius: var(--r-sm); border: 1px solid var(--outline);
-}
-.img-thumb:hover img { border-color: var(--primary); }
-.img-thumb span {
-  font-family: var(--label); font-size: 10px; font-weight: 700;
-  letter-spacing: .06em; color: var(--text-2); text-transform: uppercase;
-}
 
 /* ── NOTES FOOTER ────────────────────────────────────────────────────────────── */
 .notes-footer {
@@ -702,7 +694,6 @@ body:has(.remote-bar.visible) main { padding-bottom: 140px; }
   .top-grid { grid-template-columns: 1fr; }
   .editor-col > * { padding: 16px; font-size: 15px; }
   .notes-footer { padding-left: 56px; }
-  .img-strip { padding-left: 56px; }
   .tool-btn::after { display: none; }
   .rc-btn { padding: 10px 10px; font-size: 12px; }
 }
@@ -954,15 +945,12 @@ body:has(.remote-bar.visible) main { padding-bottom: 140px; }
 
       <div class="editor-outer">
         <div class="editor-col" id="editor-col">
-          <pre class="hl-layer" id="hl-layer" aria-hidden="true"></pre>
-          <textarea class="editor-ta" id="editor"
-                    spellcheck="true"
-                    placeholder="Begin articulating your vision here…"></textarea>
+          <div class="editor-ce" id="editor" contenteditable="true"
+               spellcheck="true" role="textbox" aria-multiline="true"
+               data-placeholder="Begin articulating your vision here…"></div>
         </div>
       </div>
     </div>
-
-    <div class="img-strip" id="img-strip"></div>
 
     <div class="notes-footer">
       <button class="new-slide-btn" onclick="addSlide()">＋  NEW SLIDE</button>
@@ -1058,21 +1046,22 @@ let presenceTimer = null;                        // heartbeat so the overlay kno
 // but showing it in the textarea buries the notes. So the textarea holds a short
 // token — ![photo 3](img:3) — and the data URL lives here. collapseImages() runs on
 // everything coming IN (remote loads, pastes); serialize() expands tokens on the
-// way OUT, so the synced wire format (and the overlay/exe) is unchanged.
+// way OUT, so the synced wire format (and the overlay/exe) is unchanged. The
+// editor renders a token line as the photo itself (see EDITOR below).
 const imgById = new Map();   // "3"      → "data:image/jpeg;base64,..."
 const idByImg = new Map();   // data URL → "3"   (reuse ids so remote echoes don't renumber)
 let   imgSeq  = 0;
-const imgStrip = document.getElementById("img-strip");   // thumbnail row under the editor
-let   imgStripKey = null;                                // ids currently shown there
-const DATA_IMG_RE  = /!\[([^\]]*)\]\((data:image\/[^)\s]+)\)/g;
+const DATA_IMG_RE  = /!\[([^\]]*)\]\((data:image\/[^)]+)\)/g;
 const IMG_TOKEN_RE = /!\[([^\]]*)\]\(img:(\d+)\)/g;
 
 function registerImage(dataUrl){
-  let id = idByImg.get(dataUrl);
-  if(!id){ id = String(++imgSeq); imgById.set(id, dataUrl); idByImg.set(dataUrl, id); }
+  const cleanUrl = dataUrl.replace(/\s+/g, "");
+  let id = idByImg.get(cleanUrl);
+  if(!id){ id = String(++imgSeq); imgById.set(id, cleanUrl); idByImg.set(cleanUrl, id); }
   return id;
 }
 function collapseImages(text){
+  if(!text) return "";
   return text.replace(DATA_IMG_RE, (m, alt, url) => {
     const id = registerImage(url);
     const label = (!alt || alt === "image") ? `photo ${id}` : alt;
@@ -1087,8 +1076,208 @@ function expandImages(text){
 // The full text that goes over Firebase / the local bridge.
 function serialize(){ return expandImages(slides.join("\n---\n")); }
 
-const editor       = document.getElementById("editor");
-const hlLayer      = document.getElementById("hl-layer");
+// ── EDITOR ────────────────────────────────────────────────────────────────────
+// A contenteditable <div> holding one <div class="ln"> per markdown line, so an
+// image token line can show the photo itself. The rest of the page talks to it
+// through `editor`, which mimics the old <textarea> API (value, selectionStart/
+// End as plain-text offsets, setSelectionRange, focus, addEventListener).
+const editorEl = document.getElementById("editor");
+const IMG_LINE_RE = /^!\[([^\]]*)\]\(img:(\d+)\)$/;
+let lastSel = {start: 0, end: 0};   // survives blur (e.g. a toolbar tap)
+let composing = false;              // IME composition in progress (mobile keyboards)
+
+// DOM → markdown text. Block elements (div/p) and <br> end lines; a photo block
+// contributes its token. Tolerates the odd DOM browsers create while editing.
+function domText(root){
+  const lines = [""];
+  let pending = false;                    // a block just ended → next content on a new line
+  const cur = () => lines[lines.length - 1];
+  const brk = () => { lines.push(""); pending = false; };
+  const isBlock = n => n.nodeType === 1 && (n.tagName === "DIV" || n.tagName === "P");
+  (function walk(node){
+    for(const c of node.childNodes){
+      if(c.nodeType === 3){
+        const t = c.nodeValue.replace(/​/g, "").replace(/ /g, " ");
+        if(!t) continue;
+        if(pending) brk();
+        lines[lines.length - 1] += t;
+      } else if(c.nodeType === 1){
+        if(c.classList.contains("ln-img")){
+          if(pending || cur() !== "") brk();
+          lines[lines.length - 1] = c.dataset.src;
+          pending = true;
+        } else if(c.tagName === "BR"){
+          // a trailing <br> only keeps an empty block open; it isn't a line break
+          if(isBlock(node) && !c.nextSibling) continue;
+          if(pending) brk();
+          brk();
+        } else if(isBlock(c)){
+          if(pending || cur() !== "") brk();
+          walk(c);
+          pending = true;
+        } else {
+          walk(c);                          // inline wrapper (span, b, font…)
+        }
+      }
+    }
+  })(root);
+  return lines.join("\n");
+}
+
+function lineClass(r){
+  if(/^# /.test(r))  return "hl-h1";
+  if(/^## /.test(r)) return "hl-h2";
+  if(/^!\[[^\]]*\]\(/.test(r)) return "hl-img";
+  if(/^[-*] /.test(r)) return "hl-bullet";
+  if(/^> /.test(r))  return "hl-prompt";
+  return "hl-body";
+}
+function lineHtml(r){
+  if(r === "") return "<br>";
+  const e = esc(r);
+  return lineClass(r) === "hl-body"
+    ? e.replace(/\*\*(.+?)\*\*/g, '<span class="hl-bold">**$1**</span>') : e;
+}
+function isImgLine(r){
+  const m = r.match(IMG_LINE_RE);
+  return !!(m && imgById.has(m[2]));
+}
+function makeLine(r){
+  const d = document.createElement("div");
+  if(isImgLine(r)){
+    const [, alt, id] = r.match(IMG_LINE_RE);
+    d.className = "ln ln-img"; d.contentEditable = "false"; d.dataset.src = r;
+    const wrap = document.createElement("span"); wrap.className = "img-wrap";
+    const im = document.createElement("img");
+    im.src = imgById.get(id); im.alt = alt; im.draggable = false;
+    const x = document.createElement("button");
+    x.type = "button"; x.className = "img-del"; x.textContent = "✕"; x.title = "Remove photo";
+    x.addEventListener("mousedown", e => e.preventDefault());
+    x.addEventListener("click", () => removeImgLine(d));
+    wrap.append(im, x); d.append(wrap);
+  } else {
+    d.className = "ln " + lineClass(r);
+    d.innerHTML = lineHtml(r);
+  }
+  return d;
+}
+function lineMatches(el, r){
+  if(el.nodeType !== 1 || el.tagName !== "DIV") return false;
+  if(el.classList.contains("ln-img")) return isImgLine(r) && el.dataset.src === r;
+  return !isImgLine(r) && el.className === "ln " + lineClass(r) && el.innerHTML === lineHtml(r);
+}
+// Bring the DOM in line with `value`, touching only lines that differ (keeps
+// photos decoded and native undo intact for plain typing).
+function renderLines(value){
+  const lines = value.split("\n");
+  const kids = editorEl.childNodes;
+  const clean = [...kids].every(k => k.nodeType === 1 && k.tagName === "DIV" && k.classList.contains("ln"));
+  if(!clean){
+    editorEl.replaceChildren(...lines.map(makeLine));
+  } else {
+    lines.forEach((r, i) => {
+      const k = kids[i];
+      if(!k) editorEl.appendChild(makeLine(r));
+      else if(!lineMatches(k, r)) k.replaceWith(makeLine(r));
+    });
+    while(kids.length > lines.length) editorEl.lastChild.remove();
+  }
+  const empty = value === "";
+  editorEl.classList.toggle("is-empty", empty);
+  if(empty) editorEl.firstChild.dataset.placeholder = editorEl.dataset.placeholder;
+}
+
+// Plain-text offset of a DOM boundary point inside the editor.
+function offsetOf(node, off){
+  if(node === editorEl){
+    const n = editorEl.childNodes.length;
+    const box = document.createElement("div");
+    [...editorEl.childNodes].slice(0, off).forEach(c => box.appendChild(c.cloneNode(true)));
+    const t = domText(box).length;
+    return (off > 0 && off < n) ? t + 1 : t;   // before line `off` = after its newline
+  }
+  const r = document.createRange();
+  r.setStart(editorEl, 0); r.setEnd(node, off);
+  const box = document.createElement("div");
+  box.appendChild(r.cloneContents());
+  return domText(box).length;
+}
+function selInEditor(){
+  const s = window.getSelection();
+  return !!(s && s.rangeCount && editorEl.contains(s.anchorNode) && editorEl.contains(s.focusNode));
+}
+function getSel(){
+  if(!selInEditor()) return lastSel;
+  const r = window.getSelection().getRangeAt(0);
+  const a = offsetOf(r.startContainer, r.startOffset);
+  const b = r.collapsed ? a : offsetOf(r.endContainer, r.endOffset);
+  return (lastSel = {start: a, end: b});
+}
+// Plain-text offset → DOM point (expects the normalized one-div-per-line DOM).
+function pointAt(off){
+  const kids = editorEl.children;
+  for(let i = 0; i < kids.length; i++){
+    const k = kids[i];
+    const img = k.classList.contains("ln-img");
+    const len = img ? k.dataset.src.length : k.textContent.length;
+    if(off <= len){
+      if(img) return off === 0 ? [editorEl, i] : [editorEl, i + 1];
+      const tw = document.createTreeWalker(k, NodeFilter.SHOW_TEXT);
+      let n, rem = off;
+      while((n = tw.nextNode())){ if(rem <= n.length) return [n, rem]; rem -= n.length; }
+      return [k, 0];
+    }
+    off -= len + 1;
+  }
+  return [editorEl, kids.length];
+}
+function setSel(a, b){
+  const len = domText(editorEl).length;
+  a = Math.max(0, Math.min(a, len)); b = Math.max(a, Math.min(b, len));
+  if(document.activeElement !== editorEl) editorEl.focus({preventScroll: true});
+  const [sn, so] = pointAt(a), [en, eo] = pointAt(b);
+  const r = document.createRange();
+  r.setStart(sn, so); r.setEnd(en, eo);
+  const s = window.getSelection();
+  s.removeAllRanges(); s.addRange(r);
+  lastSel = {start: a, end: b};
+}
+document.addEventListener("selectionchange", () => { if(selInEditor() && !composing) getSel(); });
+
+const editor = {
+  get value(){ return domText(editorEl); },
+  set value(v){
+    const keep = selInEditor() ? getSel() : null;
+    renderLines(v);
+    if(keep) setSel(keep.start, keep.end);
+  },
+  get selectionStart(){ return getSel().start; },
+  get selectionEnd(){ return getSel().end; },
+  set selectionStart(v){ setSel(v, Math.max(v, getSel().end)); },
+  set selectionEnd(v){ setSel(Math.min(getSel().start, v), v); },
+  setSelectionRange(a, b){ setSel(a, b); },
+  focus(){
+    if(document.activeElement === editorEl) return;
+    editorEl.focus({preventScroll: true});
+    setSel(lastSel.start, lastSel.end);
+  },
+  addEventListener(...args){ editorEl.addEventListener(...args); },
+};
+
+// Insert text at the caret (replacing the selection), like a textarea paste.
+function insertText(md){
+  const {start: s, end} = getSel();
+  const val = editor.value;
+  editor.value = val.slice(0, s) + md + val.slice(end);
+  editor.setSelectionRange(s + md.length, s + md.length);
+  saveCurrentSlide(); updateAll(); scheduleSync();
+}
+function removeImgLine(d){
+  d.remove();
+  if(!editorEl.firstChild) editorEl.appendChild(makeLine(""));
+  saveCurrentSlide(); updateAll(); scheduleSync();
+}
+
 const slideTabsEl  = document.getElementById("slide-tabs");
 const slideCounter = document.getElementById("slide-counter");
 const wcNum        = document.getElementById("wc-num");
@@ -1190,7 +1379,7 @@ function deleteSlide(i,event) {
   slides.splice(i,1); currentSlide=Math.min(currentSlide,slides.length-1);
   editor.value=slides[currentSlide]; updateAll(); scheduleSync();
 }
-function updateAll() { updateHighlight(); renderTabs(); updateStats(); renderImgStrip(); }
+function updateAll() { updateHighlight(); renderTabs(); updateStats(); }
 function updateStats() {
   const n=currentSlide+1, t=slides.length;
   slideCounter.textContent=`${n} / ${t}`;
@@ -1227,20 +1416,17 @@ function loadContent(text) {
 
 // ── HIGHLIGHT ─────────────────────────────────────────────────────────────────
 function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function highlightLine(r) {
-  const e=esc(r);
-  if(/^# /.test(r))    return `<span class="hl-h1">${e}</span>`;
-  if(/^## /.test(r))   return `<span class="hl-h2">${e}</span>`;
-  if(/^!\[[^\]]*\]\(/.test(r)) return `<span class="hl-img">${e}</span>`;
-  if(/^[-*] /.test(r)) return `<span class="hl-bullet">${e}</span>`;
-  if(/^> /.test(r))    return `<span class="hl-prompt">${e}</span>`;
-  const b=e.replace(/\*\*(.+?)\*\*/g,'<span class="hl-bold">**$1**</span>');
-  return `<span class="hl-body">${b}</span>`;
-}
+// Re-style lines (and fold the browser's ad-hoc editing DOM back into one div
+// per line) without moving the caret. Skipped mid-composition so mobile IMEs
+// aren't interrupted; compositionend catches up.
 function updateHighlight() {
-  hlLayer.innerHTML=editor.value.split("\n").map(highlightLine).join("\n")+"\n";
+  if(composing) return;
+  const keep = selInEditor() ? getSel() : null;
+  renderLines(domText(editorEl));
+  if(keep) setSel(keep.start, keep.end);
 }
-editor.addEventListener("scroll",()=>{ hlLayer.scrollTop=editor.scrollTop; hlLayer.scrollLeft=editor.scrollLeft; });
+editorEl.addEventListener("compositionstart", () => { composing = true; });
+editorEl.addEventListener("compositionend",   () => { composing = false; updateHighlight(); });
 
 // ── TYPING GLOW ───────────────────────────────────────────────────────────────
 editor.addEventListener("focus",()=>notesCard.classList.add("typing"));
@@ -1276,14 +1462,23 @@ editor.addEventListener("paste",e=>{
       if(file){ e.preventDefault(); handleImageFile(file); return; }
     }
   }
-  const html=e.clipboardData.getData("text/html"); if(!html) return;
+  // Always insert as markdown text ourselves — never let the browser paste raw
+  // HTML into the contenteditable.
   e.preventDefault();
-  const div=document.createElement("div"); div.innerHTML=html;
-  const md=collapseImages(nodeToMd(div).replace(/\n{3,}/g,"\n\n").trim());
-  const s=editor.selectionStart,end=editor.selectionEnd;
-  editor.value=editor.value.slice(0,s)+md+editor.value.slice(end);
-  editor.selectionStart=editor.selectionEnd=s+md.length;
-  saveCurrentSlide(); updateAll(); scheduleSync();
+  const plain = e.clipboardData?.getData("text/plain") || "";
+  const html  = e.clipboardData?.getData("text/html");
+  let md;
+  if(plain.includes("](data:image/") || !html) md = plain.replace(/\r\n?/g, "\n");
+  else { const div=document.createElement("div"); div.innerHTML=html;
+         md = nodeToMd(div).replace(/\n{3,}/g,"\n\n").trim(); }
+  if(md) insertText(collapseImages(md));
+});
+editor.addEventListener("drop", e => {
+  e.preventDefault();
+  const f = [...(e.dataTransfer?.files || [])].find(f => f.type.startsWith("image/"));
+  if(f){ handleImageFile(f); return; }
+  const t = e.dataTransfer?.getData("text/plain");
+  if(t) insertText(collapseImages(t.replace(/\r\n?/g, "\n")));
 });
 
 // ── TOOLBAR ───────────────────────────────────────────────────────────────────
@@ -1309,12 +1504,15 @@ function insertBold() {
 function insertHeading(n) { insertAtLineStart("#".repeat(n)+" "); }
 function insertBullet()   { insertAtLineStart("- "); }
 function insertPrompt()   { insertAtLineStart("> "); }
+// Toolbar taps must not steal focus (and the caret) from the editor.
+document.querySelectorAll(".tool-btn").forEach(b =>
+  b.addEventListener("mousedown", e => e.preventDefault()));
 
 // ── IMAGES ──────────────────────────────────────────────────────────────────
 // Photos ride the existing Firebase / local sync channel as a downscaled data-URL
 // image line (![image](data:...)) — no extra upload endpoint — and render in the
-// desktop overlay. In the editor they appear as a short img:N token (see IMAGE
-// TOKENS above) plus a thumbnail in the strip under the editor.
+// desktop overlay. In the editor the token line renders as the photo itself
+// (see EDITOR above); its ✕ button removes it.
 const IMG_MAX_W = 1000;   // downscale wider images to this before embedding
 const IMG_QUALITY = 0.82; // JPEG quality for the embedded copy
 
@@ -1360,42 +1558,19 @@ function handleImageFile(file){
   reader.readAsDataURL(file);
 }
 
-// Thumbnails for the photos on the current slide. Rebuilt only when the set of
-// ids changes — not on every keystroke (each <img> decodes ~100 KB).
-function renderImgStrip(){
-  const ids = [...new Set([...editor.value.matchAll(IMG_TOKEN_RE)].map(m => m[2]))].filter(id => imgById.has(id));
-  const key = ids.join(",");
-  if(key === imgStripKey) return;
-  imgStripKey = key;
-  imgStrip.innerHTML = "";
-  imgStrip.classList.toggle("visible", ids.length > 0);
-  ids.forEach(id => {
-    const b = document.createElement("button");
-    b.className = "img-thumb"; b.title = "Select this photo's line (Backspace removes it)";
-    const im = document.createElement("img"); im.src = imgById.get(id); im.alt = `photo ${id}`;
-    const lb = document.createElement("span"); lb.textContent = `photo ${id}`;
-    b.append(im, lb);
-    b.onclick = () => selectImageToken(id);
-    imgStrip.appendChild(b);
-  });
-}
-function selectImageToken(id){
-  const val = editor.value, at = val.indexOf(`](img:${id})`);
-  if(at < 0) return;
-  const ls = val.lastIndexOf("\n", at) + 1;
-  let le = val.indexOf("\n", at); le = le < 0 ? val.length : le + 1;  // include newline
-  editor.focus(); editor.setSelectionRange(ls, le);
-}
-
 editor.addEventListener("input",()=>{
   lastTypedAt=Date.now();
-  // plain-text paste / drop of a raw ![..](data:...) line → collapse to a token,
-  // keeping the caret where it was relative to the surrounding text
+  // plain-text paste / drop of a raw ![..](data:...) line → collapse to a token
   if(editor.value.includes("](data:image/")){
+    const oldVal = editor.value;
     const c = editor.selectionStart;
-    const before = collapseImages(editor.value.slice(0, c));
-    editor.value = before + collapseImages(editor.value.slice(c));
-    editor.selectionStart = editor.selectionEnd = before.length;
+    const newVal = collapseImages(oldVal);
+    if(newVal !== oldVal){
+      const beforeOld = oldVal.slice(0, c);
+      const beforeNew = collapseImages(beforeOld);
+      editor.value = newVal;
+      editor.selectionStart = editor.selectionEnd = Math.min(beforeNew.length, newVal.length);
+    }
   }
   saveCurrentSlide(); updateAll(); scheduleSync();
 });

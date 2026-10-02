@@ -217,8 +217,12 @@ copilot_profile.example.md  # Template for your private résumé summary
 | Key | Action |
 |-----|--------|
 | `←` / `→` | Previous / next slide |
+| `Ctrl` + `Shift` + `` ` `` or `Ctrl` + `` ` `` | **Toggle show / hide overlay** (system-wide global hotkey + in-app) |
+| `Ctrl` + `Shift` + `H` or `Ctrl` + `H` | **Toggle show / hide overlay** (alternative global hotkey) |
+| `F2` or `Ctrl` + `E` | **Toggle Read-Only / Editable mode** (locks click-to-edit; enables content space drag) |
+| `Alt` + `D` / `Alt` + `I` (or `Ctrl` + `[` / `]`) | **Decrease / increase window opacity** by 10% |
 | `F9` | Copilot: answer the latest transcribed question (global while copilot mode is on) |
-| `Ctrl` + `Shift` + `Q` | Web UI: take screenshot of presenter's screen & copy directly to client clipboard |
+| `Ctrl` + `Shift` + `Q` | Screen capture: take screenshot of presenter's screen & sync to client |
 | `Escape` | Close settings popup / slide switcher / stop copilot / exit |
 
 ---
