@@ -1946,12 +1946,14 @@ async function onScreenshotReceived(payload) {
   }
 
   if (copied) {
+    // Copied straight to the clipboard: just confirm, no full-screen preview.
     showToast("📋 Screenshot copied to clipboard! (Ctrl+V to paste)", "success");
-  } else {
-    showToast("📸 Screenshot received! Tap preview to copy", "info");
+    return;
   }
-
-  showScreenshotPreview(payload.image, copied);
+  // Browser refused the automatic copy (needs a user gesture / no clipboard API):
+  // fall back to the preview so the user can tap to copy.
+  showToast("📸 Screenshot received! Tap preview to copy", "info");
+  showScreenshotPreview(payload.image, false);
 }
 
 async function copyImageToClipboard(dataUrl) {
