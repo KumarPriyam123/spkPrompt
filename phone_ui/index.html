@@ -1244,6 +1244,49 @@ function setSel(a, b){
 }
 document.addEventListener("selectionchange", () => { if(selInEditor() && !composing) getSel(); });
 
+// A photo line is contenteditable=false, so browsers often can't carry the caret
+// across it with ↑/↓/←/→ (it just sticks). If the native move did nothing, step
+// over the photo ourselves.
+function lineBounds(val){      // [{s: start offset, e: end offset}] per line
+  let o = 0;
+  return val.split("\n").map(t => { const b = {s: o, e: o + t.length, t}; o += t.length + 1; return b; });
+}
+function hopPhoto(key, shift){
+  const val = editor.value, L = lineBounds(val);
+  const {start, end} = getSel();
+  const from = (shift && lastAnchor === end) ? start : end;   // the moving end
+  let i = L.findIndex(b => from >= b.s && from <= b.e);
+  if(i < 0) return false;
+  const col = from - L[i].s;
+  const isImg = b => isImgLine(b.t);
+  let target = null;
+  if(key === "ArrowUp" || key === "ArrowLeft"){
+    let j = i - 1; while(j >= 0 && isImg(L[j])) j--;
+    if(key === "ArrowLeft"){ if(col !== 0) return false; if(j < 0 || j === i - 1) return false; target = L[j].e; }
+    else { if(j < 0) target = 0; else target = L[j].s + Math.min(col, L[j].t.length); }
+  } else {
+    let j = i + 1; while(j < L.length && isImg(L[j])) j++;
+    if(key === "ArrowRight"){ if(col !== L[i].t.length) return false; if(j >= L.length || j === i + 1) return false; target = L[j].s; }
+    else { if(j >= L.length) target = val.length; else target = L[j].s + Math.min(col, L[j].t.length); }
+  }
+  if(shift){ const a = lastAnchor ?? start; setSel(Math.min(a, target), Math.max(a, target)); }
+  else setSel(target, target);
+  return true;
+}
+let lastAnchor = null;   // fixed end of a shift-extended selection
+editorEl.addEventListener("keydown", e => {
+  if(!["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) return;
+  if(e.ctrlKey || e.metaKey || e.altKey || composing) return;
+  const before = getSel();
+  if(!e.shiftKey) lastAnchor = null;
+  else if(lastAnchor === null) lastAnchor = before.start;
+  const key = e.key, shift = e.shiftKey;
+  setTimeout(() => {                       // after the browser's own move
+    const after = getSel();
+    if(after.start === before.start && after.end === before.end) hopPhoto(key, shift);
+  }, 0);
+});
+
 const editor = {
   get value(){ return domText(editorEl); },
   set value(v){
