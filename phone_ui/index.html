@@ -1661,8 +1661,41 @@ function setBtnState(btn,state){
   else if(state==="failed"){ btn.classList.add("is-failed"); btn.textContent="Retry Connection"; }
   else { btn.textContent="Establish Connection"; }
 }
-function startFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=setInterval(fbPoll,800); }
-function stopFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=null; }
+// Overlay edits arrive over Firebase's push stream (EventSource) the moment
+// they're written; the slow poll is only a safety net if the stream drops.
+let fbStream = null, fbPendingTimer = null;
+const recentWrites = [];     // our last few PUTs — their echoes must never reload the editor
+function startFbPoll(){
+  stopFbPoll();
+  const url=getDbUrl(); if(!url) return;
+  if(window.EventSource){
+    fbStream = new EventSource(`${url}/overlay/content.json`);
+    fbStream.addEventListener("put", e => {
+      try { const m = JSON.parse(e.data); if(m.path === "/") applyRemote(m.data); } catch {}
+    });
+  }
+  fbPollTimer=setInterval(fbPoll, fbStream ? 5000 : 800);
+}
+function stopFbPoll(){
+  clearInterval(fbPollTimer); fbPollTimer=null;
+  clearTimeout(fbPendingTimer); fbPendingTimer=null;
+  if(fbStream){ fbStream.close(); fbStream=null; }
+}
+function applyRemote(val){
+  // ignore our own writes (incl. late echoes of older ones) and no-op refreshes
+  if(typeof val!=="string" || val===lastRemoteText || recentWrites.includes(val) || val===serialize()) return;
+  // don't yank text out mid-keystroke; re-check once typing settles.
+  // NOTE: focus alone is unreliable — a blurred browser window still reports the
+  // editor as document.activeElement, which is why we key off recent typing instead.
+  const wait = 1500 - (Date.now()-lastTypedAt);
+  if(wait > 0){
+    clearTimeout(fbPendingTimer);
+    fbPendingTimer = setTimeout(() => applyRemote(val), wait + 50);
+    return;
+  }
+  lastRemoteText=val;          // only consume once we actually apply it
+  loadContent(val);
+}
 // Presence heartbeat — lets the overlay show LIVE SYNCING only while we're actually here
 function startPresence(){ clearInterval(presenceTimer); fbBeat(); presenceTimer=setInterval(fbBeat,3000); }
 function stopPresence(){ clearInterval(presenceTimer); presenceTimer=null; }
@@ -1676,20 +1709,13 @@ async function fbPoll(){
   try{
     const r=await fetch(`${url}/overlay/content.json`);
     if(!r.ok) return;
-    const val=await r.json();
-    // ignore our own writes and no-op refreshes
-    if(typeof val!=="string" || val===lastRemoteText || val===serialize()) return;
-    // don't yank text out mid-keystroke; retry on a later poll once typing settles.
-    // NOTE: focus alone is unreliable — a blurred browser window still reports the
-    // textarea as document.activeElement, which is why we key off recent typing instead.
-    if(Date.now()-lastTypedAt < 1500) return;
-    lastRemoteText=val;          // only consume once we actually apply it
-    loadContent(val);
+    applyRemote(await r.json());
   } catch {}
 }
 async function fbWrite(text){
   const url=getDbUrl(); if(!url) return;
   lastRemoteText=text;   // echo guard — don't reload our own push on next poll
+  recentWrites.push(text); if(recentWrites.length > 8) recentWrites.shift();
   try{
     const r=await fetch(`${url}/overlay/content.json`,{
       method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(text)
@@ -1991,9 +2017,12 @@ function pollForScreenshot(dbUrl, reqId) {
       return;
     }
     try {
-      const res = await fetch(`${dbUrl}/overlay/screenshot.json?t=${Date.now()}`);
-      if (res.ok) {
-        const data = await res.json();
+      // Poll only the tiny req_id; download the (~150 KB) image once it's ours.
+      // Polling the whole node re-downloaded the previous screenshot every tick.
+      const idRes = await fetch(`${dbUrl}/overlay/screenshot/req_id.json`);
+      if (idRes.ok && (await idRes.json()) === reqId) {
+        const res = await fetch(`${dbUrl}/overlay/screenshot.json`);
+        const data = res.ok ? await res.json() : null;
         if (data && data.req_id === reqId && data.image) {
           isSnapping = false;
           onScreenshotReceived(data);
@@ -2003,7 +2032,7 @@ function pollForScreenshot(dbUrl, reqId) {
     } catch (e) {
       console.warn("[Screenshot] poll error:", e);
     }
-    shotPollTimer = setTimeout(poll, 350);
+    shotPollTimer = setTimeout(poll, 200);
   }
   poll();
 }

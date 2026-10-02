@@ -58,7 +58,13 @@ class OverlayApp:
         self._firebase_url  = ""         # last connected Firebase URL
         self._last_synced   = None       # last content seen/sent over sync (echo guard)
         self._edit_guard_until = 0       # ignore inbound sync briefly after a local edit
-        self._fb_last_ok    = 0          # time of last successful Firebase poll (badge health)
+        self._fb_last_ok    = 0          # time of last Firebase stream activity
+        self._fb_streams    = set()      # Firebase nodes whose push stream is connected
+        self._http          = None       # keep-alive requests.Session for Firebase writes
+        self._fb_put_lock    = threading.Lock()  # guards the single-writer slot below
+        self._fb_put_pending = None      # newest content waiting to be PUT
+        self._fb_put_busy    = False     # writer thread running
+        self._remote_latest = None       # newest remote content (retried after a local edit)
         self._fb_presence_val = None     # last phone heartbeat value seen
         self._fb_presence_at  = 0        # local time that heartbeat last changed (peer-present)
         self._last_cmd_ts     = 0        # timestamp of the last processed remote command
@@ -74,6 +80,7 @@ class OverlayApp:
 
         self._imgs          = []         # live tk image refs for the active card (GC guard)
         self._img_store     = {}         # image token store: "1" -> data URL (prevents raw bytes in editor)
+        self._img_cache     = {}         # decoded/resized tk images keyed by (src, size)
         self._readonly      = False      # read-only presenter mode (locks click-to-edit)
         self._hidden        = False      # overlay hidden via the global show/hide hotkey
         self._hotkey_id     = None       # id of the registered Win32 global hotkey
@@ -757,6 +764,21 @@ class OverlayApp:
             token_id = src[4:]
             src = self._img_store.get(token_id, src)
 
+        # Every remote keystroke re-renders the card; decoding + resizing each
+        # photo again made typing on the phone lag on the overlay. Reuse them.
+        key = (hash(src), len(src), avail, max_h)
+        cached = self._img_cache.get(key)
+        if cached is not None:
+            return cached
+        img = self._decode_image(src, avail, max_h)
+        if img is not None:
+            if len(self._img_cache) >= 48:
+                self._img_cache.pop(next(iter(self._img_cache)))   # drop oldest
+            self._img_cache[key] = img
+        return img
+
+    def _decode_image(self, src, avail, max_h):
+        import base64, io
         data = None
         if src.startswith("data:"):
             try:
@@ -1078,8 +1100,7 @@ class OverlayApp:
         self._last_synced = content        # echo guard for inbound listeners
         self._edit_guard_until = time.time() + 1.5   # ride out the PUT round-trip
         if self._sync_mode == "firebase":
-            threading.Thread(target=self._firebase_put,
-                             args=(content,), daemon=True).start()
+            self._queue_firebase_put(content)
         elif self._sync_mode == "local":
             if self._ws_loop and self._ws_clients:
                 self._ws_loop.call_soon_threadsafe(self._ws_broadcast, content)
@@ -1104,11 +1125,30 @@ class OverlayApp:
             parts = [buffer]
         self._broadcast_content("\n---\n".join(parts))
 
+    def _queue_firebase_put(self, content):
+        """Hand content to one writer thread that always PUTs the newest value.
+        A thread per PUT let a slow older write land after a newer one; this
+        also coalesces bursts of keystrokes into a single write."""
+        with self._fb_put_lock:
+            self._fb_put_pending = content
+            if self._fb_put_busy:
+                return
+            self._fb_put_busy = True
+        threading.Thread(target=self._firebase_writer, name="fb-writer", daemon=True).start()
+
+    def _firebase_writer(self):
+        while True:
+            with self._fb_put_lock:
+                content, self._fb_put_pending = self._fb_put_pending, None
+                if content is None:
+                    self._fb_put_busy = False
+                    return
+            self._firebase_put(content)
+
     def _firebase_put(self, content):
         try:
-            import requests
-            requests.put(f"{self._firebase_url}/overlay/content.json",
-                         data=json.dumps(content), timeout=5)
+            self._fb_session().put(f"{self._firebase_url}/overlay/content.json",
+                                   data=json.dumps(content), timeout=5)
         except Exception as e:
             print(f"[Firebase] push failed: {type(e).__name__}: {e}")
 
@@ -1211,8 +1251,14 @@ class OverlayApp:
     # ── REMOTE SYNC ──────────────────────────────────────────────────────────
 
     def _apply_remote_content(self, content):
+        self._remote_latest = content
         if self._editing or time.time() < self._edit_guard_until:
-            return              # don't clobber an in-progress / just-finished local edit
+            # don't clobber an in-progress / just-finished local edit; a push stream
+            # delivers each change once, so re-check until the edit is done
+            self.root.after(400, lambda: self._remote_latest == content
+                            and content != self._last_synced
+                            and self._apply_remote_content(content))
+            return
         self._last_synced = content   # mark seen only now that we're actually applying
         content = content.replace('\r\n', '\n').replace('\r', '\n')
         parsed  = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
@@ -1350,10 +1396,13 @@ class OverlayApp:
             ratio = min(max_dim / w, max_dim / h)
             new_w = max(1, int(w * ratio))
             new_h = max(1, int(h * ratio))
-            im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            # reducing_gap: shrink by a cheap integer factor first, then filter —
+            # several times faster than a full LANCZOS pass, same look on screen text
+            im = im.resize((new_w, new_h), Image.Resampling.LANCZOS, reducing_gap=2.0)
 
         bio = io.BytesIO()
-        im.save(bio, format='JPEG', quality=85, optimize=True)
+        # optimize=True re-encodes for a few % smaller files at ~2x the encode time
+        im.save(bio, format='JPEG', quality=85)
         b64 = base64.b64encode(bio.getvalue()).decode('ascii')
         return f"data:image/jpeg;base64,{b64}", im
 
@@ -1398,22 +1447,22 @@ class OverlayApp:
                 req_id = f"shot_{int(time.time()*1000)}"
             print(f"[Screenshot] Capturing screen for req {req_id}...")
             data_url, im = self._take_screenshot_data_url()
-            if im is not None:
-                self._copy_image_to_system_clipboard(im)
             payload = {
                 "req_id": req_id,
                 "ts": time.time(),
                 "image": data_url
             }
             if (self._sync_mode == "firebase" or not self._sync_mode) and self._firebase_url:
-                import requests
-                r = requests.put(f"{self._firebase_url}/overlay/screenshot.json",
-                                 data=json.dumps(payload), timeout=10)
+                r = self._fb_session().put(f"{self._firebase_url}/overlay/screenshot.json",
+                                           data=json.dumps(payload), timeout=10)
                 print(f"[Screenshot] Pushed screenshot to Firebase (HTTP {r.status_code})")
             if self._sync_mode == "local" or (self._ws_loop and self._ws_clients):
                 msg = json.dumps({"type": "screenshot", **payload})
                 self._ws_loop.call_soon_threadsafe(self._ws_broadcast, msg)
                 print(f"[Screenshot] Broadcasted screenshot to WS clients")
+            # local clipboard copy last — the phone is waiting on the upload above
+            if im is not None:
+                self._copy_image_to_system_clipboard(im)
         except Exception as e:
             print(f"[Screenshot] Error: {type(e).__name__}: {e}")
 
@@ -1424,47 +1473,107 @@ class OverlayApp:
         self._last_cmd_ts = time.time() * 1000
         v = self._sync_version
         self.root.after(0, self._show_live_badge)
-        threading.Thread(target=self._firebase_loop,
-                         args=(self._firebase_url, v), daemon=True).start()
+        # Firebase REST streaming (Server-Sent Events): Firebase pushes each change
+        # the moment it lands, over one long-lived connection per node. Replaces
+        # polling /overlay.json, which re-downloaded every photo and the last
+        # screenshot (~250 KB) over a fresh TLS connection several times a second.
+        # Each node is streamed on its own so a big screenshot never rides along.
+        for node, handler in (("content",  self._on_fb_content),
+                              ("command",  self._on_fb_command),
+                              ("presence", self._on_fb_presence)):
+            threading.Thread(target=self._firebase_stream,
+                             args=(self._firebase_url, node, handler, v),
+                             name=f"fb-{node}", daemon=True).start()
 
-    def _firebase_loop(self, db_url, version):
+    def _fb_session(self):
+        """Shared keep-alive HTTP session for Firebase writes. Reusing the TLS
+        connection makes a PUT ~75 ms instead of ~0.5-1 s for a fresh one."""
+        if self._http is None:
+            import requests
+            self._http = requests.Session()
+        return self._http
+
+    def _firebase_stream(self, db_url, node, handler, version):
         try:
             import requests
         except ImportError:
             return
-        # Poll the parent node so one request returns both the notes content and
-        # the phone's presence heartbeat (written by the web UI while it's open).
-        url  = f"{db_url}/overlay.json"
+        url, backoff = f"{db_url}/overlay/{node}.json", 1.0
         while self._sync_version == version:
             try:
-                r = requests.get(url, timeout=5)
-                if r.ok:
-                    self._fb_last_ok = time.time()
-                    data = r.json()
-                    if isinstance(data, dict):
-                        content  = data.get("content")
-                        presence = data.get("presence")
-                    elif isinstance(data, str):       # backward-compat (flat content)
-                        content, presence = data, None
-                    else:
-                        content, presence = None, None
-                    # "peer present" = heartbeat keeps changing; track when it last did
-                    if presence is not None and presence != self._fb_presence_val:
-                        self._fb_presence_val = presence
-                        self._fb_presence_at  = time.time()
-                    # NOTE: don't mark content as seen here — _apply_remote_content does
-                    # that only when it actually applies, so an update that arrives
-                    # mid-edit is retried (not silently dropped) once editing ends.
-                    if isinstance(content, str) and content != self._last_synced:
-                        self.root.after(0, lambda c=content: self._apply_remote_content(c))
-                    command = data.get("command") if isinstance(data, dict) else None
-                    if isinstance(command, dict) and "cmd" in command:
-                        self.root.after(0, lambda d=command: self._handle_remote_cmd(d))
-            except Exception as e:
-                print(f"[Firebase] {type(e).__name__}: {e}")
-                time.sleep(2)
-                continue
-            time.sleep(0.4)    # ~2.5 req/s — snappier pickup, still well under rate limits
+                # read timeout > Firebase's 30 s keep-alive, so a silent drop is noticed
+                with requests.get(url, headers={"Accept": "text/event-stream"},
+                                  stream=True, timeout=(10, 75)) as r:
+                    if not r.ok:
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                    self._fb_streams.add(node)
+                    backoff = 1.0
+                    value, event = None, None
+                    # raw.readline(): Firebase streams without chunked encoding, and
+                    # iter_lines() then buffers until the connection closes.
+                    while True:
+                        raw = r.raw.readline()
+                        if not raw:
+                            raise RuntimeError("stream closed")
+                        if self._sync_version != version:
+                            return
+                        self._fb_last_ok = time.time()
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if line.startswith("event:"):
+                            event = line[6:].strip()
+                        elif line.startswith("data:") and event in ("put", "patch"):
+                            msg = json.loads(line[5:].strip())
+                            value = self._fb_apply_event(value, event, msg.get("path", "/"),
+                                                         msg.get("data"))
+                            handler(value)
+                        elif event in ("cancel", "auth_revoked"):
+                            raise RuntimeError(f"stream {event}")
+            except Exception as e:                   # noqa: BLE001 — reconnect on anything
+                if self._sync_version != version:
+                    return
+                print(f"[Firebase] {node} stream: {type(e).__name__}: {e} — reconnecting")
+            finally:
+                self._fb_streams.discard(node)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+
+    @staticmethod
+    def _fb_apply_event(value, event, path, data):
+        """Fold one SSE put/patch into the locally mirrored node value."""
+        keys = [k for k in path.split("/") if k]
+        if not keys:
+            if event == "put" or not isinstance(value, dict):
+                return data
+            return {**value, **(data or {})}
+        root = value if isinstance(value, dict) else {}
+        node = root
+        for k in keys[:-1]:
+            if not isinstance(node.get(k), dict):
+                node[k] = {}
+            node = node[k]
+        if event == "patch" and isinstance(node.get(keys[-1]), dict) and isinstance(data, dict):
+            node[keys[-1]].update(data)
+        elif data is None:
+            node.pop(keys[-1], None)
+        else:
+            node[keys[-1]] = data
+        return root
+
+    def _on_fb_content(self, content):
+        # NOTE: don't mark content as seen here — _apply_remote_content does that
+        # only when it actually applies (and retries while a local edit is open).
+        if isinstance(content, str) and content != self._last_synced:
+            self.root.after(0, lambda c=content: self._apply_remote_content(c))
+
+    def _on_fb_command(self, command):
+        if isinstance(command, dict) and "cmd" in command:
+            self.root.after(0, lambda d=dict(command): self._handle_remote_cmd(d))
+
+    def _on_fb_presence(self, presence):
+        # "peer present" = heartbeat keeps changing; track when it last did
+        if presence is not None and presence != self._fb_presence_val:
+            self._fb_presence_val = presence
+            self._fb_presence_at  = time.time()
 
     def start_local_ws_server(self, port=8765):
         self._sync_version += 1
@@ -1531,8 +1640,8 @@ class OverlayApp:
     def _sync_health(self):
         """Return (live, label, color). `live` (a peer is actively present) → pulse."""
         if self._sync_mode == "firebase":
-            if time.time() - self._fb_last_ok >= 3:
-                return False, "RECONNECTING…", C["yellow"]          # can't reach Firebase
+            if "content" not in self._fb_streams:
+                return False, "RECONNECTING…", C["yellow"]          # stream not connected
             if time.time() - self._fb_presence_at < 8:
                 return True, "LIVE SYNCING", C["primary"]            # phone is on the line
             return False, "CONNECTED", C["on_sv"]                    # FB ok, no phone yet
