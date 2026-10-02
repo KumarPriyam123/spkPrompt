@@ -983,6 +983,8 @@ body:has(.remote-bar.visible) main { padding-bottom: 140px; }
   <div class="rc-row">
     <div class="rc-slider-group">
       <span class="slider-lbl">SCROLL</span>
+      <button class="rc-btn rc-scroll-btn" id="rc-scroll-up" title="Scroll up (hold to keep scrolling)">▲</button>
+      <button class="rc-btn rc-scroll-btn" id="rc-scroll-down" title="Scroll down (hold to keep scrolling)">▼</button>
       <input type="range" class="rc-slider" id="rc-scroll"
              min="0" max="100" value="0"
              oninput="onScrollSlider(this)" />
@@ -1851,6 +1853,38 @@ function onScrollSlider(el) {
   clearTimeout(scrollDebounce);
   scrollDebounce = setTimeout(() => sendCmd({cmd:"scroll_to", fraction: frac}), 30);
 }
+
+// ▲ / ▼ nudge buttons (hold = keep scrolling) and mouse wheel over the SCROLL row.
+// The overlay only ever reads the LATEST command (Firebase holds one slot), so
+// movement is summed and flushed as a single "scroll" every SCROLL_FLUSH_MS.
+const SCROLL_FLUSH_MS = 220, SCROLL_STEP = 3, SCROLL_HOLD_MS = 220;
+let pendingScroll = 0, scrollFlushTimer = null, scrollHoldTimer = null;
+function queueScroll(delta) {
+  pendingScroll += delta;
+  if (scrollFlushTimer) return;
+  scrollFlushTimer = setTimeout(() => {
+    scrollFlushTimer = null;
+    const d = Math.max(-50, Math.min(50, Math.round(pendingScroll)));
+    pendingScroll = 0;
+    if (d) sendCmd({cmd: "scroll", delta: d});
+  }, SCROLL_FLUSH_MS);
+}
+function bindScrollBtn(id, dir) {
+  const b = document.getElementById(id);
+  const stop = () => { clearInterval(scrollHoldTimer); scrollHoldTimer = null; };
+  b.addEventListener("pointerdown", e => {
+    e.preventDefault(); stop();
+    queueScroll(dir * SCROLL_STEP);
+    scrollHoldTimer = setInterval(() => queueScroll(dir * SCROLL_STEP), SCROLL_HOLD_MS);
+  });
+  ["pointerup", "pointerleave", "pointercancel", "blur"].forEach(t => b.addEventListener(t, stop));
+}
+bindScrollBtn("rc-scroll-up", -1);
+bindScrollBtn("rc-scroll-down", 1);
+document.querySelector(".rc-slider-group:has(#rc-scroll)").addEventListener("wheel", e => {
+  e.preventDefault();
+  queueScroll(Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 40)));
+}, {passive: false});
 
 let opacityDebounce = null;
 function onOpacitySlider(el) {
